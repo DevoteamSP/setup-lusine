@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.11,<3.13"
 # dependencies = []
 # ///
 """Set up L'Usine with `uv` as the only prerequisite for a visitor.
@@ -273,7 +273,7 @@ def installer(target: Path, *args: str, token: str = "") -> None:
     env = {"PYTHONPATH": str(target / "navigator"), "PYTHONDONTWRITEBYTECODE": "1"}
     if token:
         env["LUSINE_TOKEN"] = token
-    command = [uv_binary(), "run", "--no-project", "--python", ">=3.11", "python", "-m"]
+    command = [uv_binary(), "run", "--no-project", "--python", ">=3.11,<3.13", "python", "-m"]
     if run([*command, "utils.installer", *args], env=env, cwd=target):
         raise SetupError("Could not finish unpacking L'Usine. Run this again.")
 

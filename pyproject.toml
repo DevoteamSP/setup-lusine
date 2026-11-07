@@ -2,7 +2,7 @@
 name = "setup-lusine"
 version = "1.0.0"
 description = "Sets up L'Usine, the Devoteam Snowflake Partner hub: sign in to GitHub, download, start"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = []
 
 [project.scripts]
