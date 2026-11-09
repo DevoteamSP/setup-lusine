@@ -20,7 +20,9 @@ Two profiles:
 from __future__ import annotations
 
 import argparse
+import functools
 import getpass
+import itertools
 import json
 import os
 import shutil
@@ -28,11 +30,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import deque
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -56,18 +60,228 @@ ACCESS_HELP = (
     "accept it, then run this again."
 )
 sleep = time.sleep  # replaced in the tests
+SILENT = {  # for commands whose output nobody needs
+    "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+    "check": False,
+}  # fmt: skip
 
 
 class SetupError(Exception):
     """Something the person can act on; the message says what."""
 
 
+# --- terminal ---------------------------------------------------------------------------------
+# Standard library only, and ASCII in this file: the fancy glyphs are written as escapes. When the
+# output is not a terminal (a pipe, CI, NO_COLOR) everything falls back to plain text.
+
+_UNICODE = {
+    "ok": "\u2714", "bad": "\u2716", "warn": "!", "dot": "\u25cf", "on": "\u2588", "off": "\u2591",
+    "h": "\u2500", "v": "\u2502", "tl": "\u256d", "tr": "\u256e", "bl": "\u2570", "br": "\u256f",
+    "frames": "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f",
+}  # fmt: skip
+_PLAIN = {
+    "ok": "[ok]", "bad": "[!!]", "warn": "[!]", "dot": "*", "on": "#", "off": "-",
+    "h": "-", "v": "|", "tl": "+", "tr": "+", "bl": "+", "br": "+", "frames": "|/-\\",
+}  # fmt: skip
+STYLES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+
+
+@functools.cache
+def fancy() -> bool:
+    """True on an interactive terminal that understands colors and cursor control."""
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb" or not sys.stdout.isatty():
+        return False
+    if os.name == "nt":  # Windows 10+ understands ANSI once the console asks for it
+        try:
+            import ctypes
+
+            kernel = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel.GetStdHandle(-11)
+            mode = ctypes.c_ulong()
+            if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+            if not kernel.SetConsoleMode(handle, mode.value | 0x0004):
+                return False
+        except (AttributeError, OSError):
+            return False
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        return False
+    return True
+
+
+def g(name: str) -> str:
+    return (_UNICODE if fancy() else _PLAIN)[name]
+
+
+def paint(text: str, *styles: str) -> str:
+    if not fancy():
+        return text
+    codes = ";".join(STYLES[style] for style in styles)
+    return f"\x1b[{codes}m{text}\x1b[0m"
+
+
+def width() -> int:
+    return max(40, min(shutil.get_terminal_size((80, 24)).columns, 100))
+
+
 def say(text: str = "") -> None:
     print(f"    {text}" if text else "")
 
 
-def step(number: int, total: int, title: str) -> None:
-    print(f"\n==> Step {number} of {total}: {title}")
+def good(text: str) -> None:
+    print(f"  {paint(g('ok'), 'green')} {text}")
+
+
+def warn(text: str) -> None:
+    print(f"  {paint(g('warn'), 'yellow', 'bold')} {text}")
+
+
+def box(lines: Sequence[str], *, color: str = "cyan", indent: int = 2) -> None:
+    inner = max(len(line) for line in lines) + 4
+    pad = " " * indent
+    print(pad + paint(g("tl") + g("h") * inner + g("tr"), color))
+    for line in lines:
+        side = paint(g("v"), color)
+        print(f"{pad}{side}  {paint(line.ljust(inner - 4), 'bold')}  {side}")
+    print(pad + paint(g("bl") + g("h") * inner + g("br"), color))
+
+
+def banner() -> None:
+    print()
+    box(["L'USINE  -  Snow Builders", "Devoteam Snowflake Partner"])
+
+
+STEPS = {"total": 0}  # set once the profile is known: visitor 4 steps, developer 5
+
+
+def step(number: int, title: str) -> None:
+    label = f" {number}/{STEPS['total']} " if STEPS["total"] else f" {number} "
+    rule = g("h") * max(4, width() - len(label) - len(title) - 6)
+    print(f"\n  {paint(label, 'bold', 'cyan')} {paint(title, 'bold')} {paint(rule, 'dim')}")
+
+
+def ask_yes(question: str, *, default: bool = True) -> bool:
+    answer = input(f"  {paint('?', 'cyan', 'bold')} {question} [{'Y/n' if default else 'y/N'}] ")
+    return default if not answer.strip() else answer.strip().lower().startswith("y")
+
+
+def propose(command: Sequence[str], why: str, *, interactive: bool) -> bool:
+    """Show the command line, then run it for the person, or let them run it themselves.
+
+    Returns True when this script ran it, False when the person said they would (or did).
+    """
+    shown = " ".join(f'"{part}"' if " " in part else part for part in command)
+    say(why)
+    print(f"\n      {paint('$', 'dim')} {paint(shown, 'bold', 'cyan')}\n")
+    if not interactive or ask_yes("Run it for you?"):
+        return True
+    say("Run it in another window, then come back here.")
+    input("    Press Enter when it is done. ")
+    return False
+
+
+class Task:
+    """One line that spins while work goes on, then settles into a tick (or a cross) and a time.
+
+    Set ``detail`` from the work to show progress next to the label; ``failed`` for a cross.
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.detail = ""
+        self.failed = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started = 0.0
+
+    def progress(self, done: int, total: int | None) -> None:
+        mb = f"{done / 1e6:.1f} MB"
+        if not total:
+            self.detail = mb
+            return
+        cells = 20
+        filled = min(cells, done * cells // total)
+        bar = g("on") * filled + g("off") * (cells - filled)
+        self.detail = f"{bar} {done * 100 // total:3d}%  {mb}"
+
+    def _spin(self) -> None:
+        for frame in itertools.cycle(g("frames")):
+            room = max(0, width() - len(self.label) - 8)
+            detail = paint(self.detail[:room], "dim") if self.detail else ""
+            sys.stdout.write(f"\r\x1b[2K  {paint(frame, 'cyan')} {self.label}  {detail}")
+            sys.stdout.flush()
+            if self._stop.wait(0.08):
+                return
+
+    def __enter__(self) -> Task:
+        self._started = time.monotonic()
+        if fancy():
+            sys.stdout.write("\x1b[?25l")  # hide the cursor while spinning
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        else:
+            print(f"    {self.label}...")
+        return self
+
+    def __exit__(self, exc_type, *_exc) -> bool:
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+            sys.stdout.write("\r\x1b[2K\x1b[?25h")
+        if exc_type is not None or self.failed:
+            print(f"  {paint(g('bad'), 'red')} {self.label}")
+        else:
+            took = paint(f"{time.monotonic() - self._started:.1f}s", "dim")
+            print(f"  {paint(g('ok'), 'green')} {self.label}  {took}")
+        return False
+
+
+def run_quiet(
+    command: Sequence[str],
+    label: str,
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
+    """Run a command behind a spinner showing its last line; on failure print what it said."""
+    merged = {**os.environ, **(env or {})}
+    tail: deque[str] = deque(maxlen=12)
+    code = 1
+    with Task(label) as task:
+        try:
+            proc = subprocess.Popen(  # noqa: S603
+                list(command), cwd=cwd, env=merged, text=True, encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )  # fmt: skip
+        except OSError as exc:
+            tail.append(str(exc))
+            task.failed = True
+        else:
+            try:
+                for line in proc.stdout or ():
+                    if line.strip():
+                        tail.append(line.rstrip())
+                        task.detail = line.strip()
+                code = proc.wait()
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            task.failed = code != 0
+    if code:
+        for line in tail:
+            say(paint(line, "dim"))
+    return code
+
+
+def copy_to_clipboard(text: str) -> bool:
+    other = ["xclip", "-selection", "c"]
+    tools = {"darwin": ["pbcopy"], "win32": ["clip"]}.get(sys.platform, other)
+    try:
+        return subprocess.run(tools, input=text, text=True, timeout=5, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 # --- GitHub ----------------------------------------------------------------------------------
@@ -107,47 +321,54 @@ def code_signin(*, interactive: bool) -> str:
         why = reply.get("error_description") or reply.get("error") or "no reason given"
         raise SetupError(f"GitHub did not give a code: {why}.")
     uri = reply.get("verification_uri") or f"{WEB}/login/device"
-    say("L'Usine's files are private, so GitHub must know who you are. It takes a minute:")
-    say("  1. Your code is below. 2. GitHub opens in your browser.")
-    say('  3. Type the code there, click "Continue", then click "Authorize".')
-    say("Nothing to copy back: L'Usine receives the sign-in by itself.")
-    print(f"\n        Your code:  {reply['user_code']}\n")
+    say("L'Usine's files are private, so GitHub must know who you are. It takes a minute.")
+    print()
+    box([f"Your code:   {reply['user_code']}"], color="yellow", indent=6)
+    print()
     if interactive:
-        input("    Press Enter to open GitHub (or Control-C to stop). ")
+        copied = copy_to_clipboard(reply["user_code"])
+        say("GitHub opens in your browser" + (", the code is copied: paste it." if copied else "."))
         webbrowser.open(uri)
-    say("Waiting for you to authorize it on GitHub...")
+    say(f"Not opening? Go to {paint(uri, 'cyan')} and type the code.")
+    say('Then click "Continue" and "Authorize". Nothing to copy back.')
+    print()
     interval = int(reply.get("interval", 5))
     deadline = time.monotonic() + int(reply.get("expires_in", 900))
     failures = 0
-    while time.monotonic() < deadline:
-        sleep(interval)
-        try:
-            poll = _post_json(
-                f"{WEB}/login/oauth/access_token",
-                {
-                    "client_id": CLIENT_ID,
-                    "device_code": reply["device_code"],
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                },
-            )
-        except SetupError:
-            failures += 1
-            if failures >= 5:
-                raise
-            continue
-        failures = 0
-        if poll.get("access_token"):
-            return poll["access_token"]
-        error = poll.get("error", "")
-        if error == "slow_down":
-            interval = int(poll.get("interval", interval + 5))
-        elif error == "expired_token":
-            raise SetupError("The code expired. Run this again for a new one.")
-        elif error == "access_denied":
-            raise SetupError("The sign-in was cancelled on GitHub.")
-        elif error != "authorization_pending":
-            why = poll.get("error_description") or error or "no reason given"
-            raise SetupError(f"GitHub refused the sign-in: {why}.")
+    with Task("Waiting for you to authorize on GitHub") as task:
+        while time.monotonic() < deadline:
+            left = int(deadline - time.monotonic())
+            task.detail = f"{left // 60}:{left % 60:02d} left"
+            sleep(interval)
+            try:
+                poll = _post_json(
+                    f"{WEB}/login/oauth/access_token",
+                    {
+                        "client_id": CLIENT_ID,
+                        "device_code": reply["device_code"],
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    },
+                )
+            except SetupError:
+                failures += 1
+                if failures >= 5:
+                    raise
+                continue
+            failures = 0
+            if poll.get("access_token"):
+                task.label = "Authorized on GitHub"
+                task.detail = ""
+                return poll["access_token"]
+            error = poll.get("error", "")
+            if error == "slow_down":
+                interval = int(poll.get("interval", interval + 5))
+            elif error == "expired_token":
+                raise SetupError("The code expired. Run this again for a new one.")
+            elif error == "access_denied":
+                raise SetupError("The sign-in was cancelled on GitHub.")
+            elif error != "authorization_pending":
+                why = poll.get("error_description") or error or "no reason given"
+                raise SetupError(f"GitHub refused the sign-in: {why}.")
     raise SetupError("Nobody authorized the code in time. Run this again.")
 
 
@@ -182,7 +403,7 @@ def saved_token() -> str:
 def get_token(*, interactive: bool) -> str:
     token = saved_token()
     if token and repo_status(token) == 200:
-        say("GitHub sign-in: ready")
+        good("Signed in to GitHub")
         return token
     if not interactive and not CLIENT_ID:
         raise SetupError("No GitHub sign-in and no keyboard to ask for one.")
@@ -201,7 +422,7 @@ def get_token(*, interactive: bool) -> str:
             f"You are signed in, but GitHub does not let you open {REPO} (code {status}).\n"
             f"{ACCESS_HELP}"
         )
-    say("GitHub sign-in: ready")
+    good("Signed in to GitHub")
     return token
 
 
@@ -210,16 +431,22 @@ def get_token(*, interactive: bool) -> str:
 
 def download(target: Path, token: str) -> str:
     """Unpack the latest files of the repository into ``target`` (new or empty). Returns the sha."""
+    archive = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
     try:
-        with _open(f"{API}/repos/{REPO}/commits/HEAD", token=token) as reply:
-            sha = reply.read().decode().strip()
-        archive = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
-        with archive, _open(f"{API}/repos/{REPO}/tarball/{sha}", token=token) as reply:
-            shutil.copyfileobj(reply, archive)
+        with Task("Downloading L'Usine") as task, archive:
+            with _open(f"{API}/repos/{REPO}/commits/HEAD", token=token) as reply:
+                sha = reply.read().decode().strip()
+            with _open(f"{API}/repos/{REPO}/tarball/{sha}", token=token) as reply:
+                total = int(reply.headers.get("Content-Length") or 0) or None
+                done = 0
+                while chunk := reply.read(256 * 1024):
+                    archive.write(chunk)
+                    done += len(chunk)
+                    task.progress(done, total)
+        with Task("Unpacking the files"):
+            extract(Path(archive.name), target)
     except urllib.error.URLError as exc:
         raise SetupError(f"Could not download L'Usine ({exc}). Run this again.") from exc
-    try:
-        extract(Path(archive.name), target)
     finally:
         Path(archive.name).unlink(missing_ok=True)
     return sha
@@ -274,60 +501,156 @@ def installer(target: Path, *args: str, token: str = "") -> None:
     if token:
         env["LUSINE_TOKEN"] = token
     command = [uv_binary(), "run", "--no-project", "--python", ">=3.11,<3.13", "python", "-m"]
-    if run([*command, "utils.installer", *args], env=env, cwd=target):
+    labels = {"adopt": "Marking the copy", "update": "Updating the files"}
+    label = labels.get(args[0], "Saving your sign-in")
+    if run_quiet([*command, "utils.installer", *args], label, env=env, cwd=target):
         raise SetupError("Could not finish unpacking L'Usine. Run this again.")
 
 
+def warm_up_python() -> None:
+    """While the person signs in, let uv fetch a Python if there is none: the wait costs nothing."""
+
+    def work() -> None:
+        try:
+            uv = uv_binary()
+            spec = ">=3.11,<3.13"
+            if subprocess.run([uv, "python", "find", spec], **SILENT).returncode:
+                subprocess.run([uv, "python", "install", "3.12"], **SILENT)
+        except (SetupError, OSError):
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def prepare(target: Path) -> None:
+    """Install the libraries now, behind a progress line, so that the first start is instant."""
+    if run_quiet([uv_binary(), "sync"], "Installing the libraries", cwd=target):
+        warn("Not finished: the first start will install the rest.")
+
+
 def visitor(target: Path, *, interactive: bool, dry_run: bool) -> None:
-    step(2, 4, "Sign in to GitHub")
+    step(2, "Sign in to GitHub")
     if dry_run:
         say("(dry run) sign in, then download the latest files of " + REPO)
         return
     token = get_token(interactive=interactive)
-    step(3, 4, "Download L'Usine")
+    step(3, "Download L'Usine")
     if (target / ".lusine-snapshot.json").is_file():
-        say("L'Usine is already here: updating it")
         installer(target, "update", str(target), token=token)
     elif target.exists() and any(target.iterdir()):
         raise SetupError(f"The folder {target} exists and was not made by L'Usine. Use --dir.")
     else:
-        say("Downloading (the first time takes a minute)")
         sha = download(target, token)
         installer(target, "adopt", str(target), REPO, sha, token=token)
     installer(target, "save-token", token=token)
 
 
+TOOL_DIRS = {
+    "win32": [
+        os.path.join(os.environ.get(var, ""), *rest)
+        for var, rest in (
+            ("ProgramFiles", ("GitHub CLI",)),
+            ("ProgramFiles", ("Git", "cmd")),
+            ("LOCALAPPDATA", ("Programs", "GitHub CLI")),
+            ("LOCALAPPDATA", ("Programs", "Git", "cmd")),
+        )
+        if os.environ.get(var)
+    ],
+    "darwin": ["/opt/homebrew/bin", "/usr/local/bin"],
+}
+INSTALLERS = {
+    "win32": ("winget", {"git": "Git.Git", "gh": "GitHub.cli"}),
+    "darwin": ("brew", {"git": "git", "gh": "gh"}),
+}
+
+
+def find_tool(name: str) -> str | None:
+    """Where ``name`` is. Looks past PATH: right after winget or brew, a window opened earlier
+    does not see the new tool yet, and that is the 'gh is not installed' people reported."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for folder in TOOL_DIRS.get(sys.platform, []):
+        for file in (Path(folder) / name, Path(folder) / f"{name}.exe"):
+            if file.is_file() and os.access(file, os.X_OK):
+                os.environ["PATH"] = folder + os.pathsep + os.environ.get("PATH", "")
+                return str(file)
+    return None
+
+
 def have(name: str) -> bool:
-    return shutil.which(name) is not None
+    return find_tool(name) is not None
+
+
+def install_tools(missing: list[str]) -> None:
+    """Install what is missing with the system's package manager, after a yes."""
+    manager, ids = INSTALLERS.get(sys.platform, ("", {}))
+    if not manager or not shutil.which(manager):
+        return
+    if not ask_yes(f"Install {' and '.join(missing)} now with {manager}?"):
+        return
+    for name in missing:
+        if manager == "winget":
+            args = ["install", "--id", ids[name], "-e", "--silent"]
+            args += ["--accept-package-agreements", "--accept-source-agreements"]
+        else:
+            args = ["install", ids[name]]
+        run_quiet([manager, *args], f"Installing {name}")
 
 
 def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
-    step(2, 4, "Check git and the GitHub tool (gh)")
+    step(2, "Check git and the GitHub tool (gh)")
     missing = [name for name in ("git", "gh") if not have(name)]
+    if missing and interactive and not dry_run:
+        warn(f"Not found: {', '.join(missing)}")
+        install_tools(missing)
+        missing = [name for name in missing if not have(name)]
     if missing:
         hint = {"darwin": "brew install git gh", "win32": "winget install Git.Git GitHub.cli"}
         how = hint.get(sys.platform, "your package manager")
+        if interactive and not dry_run and ask_yes("Continue as a visitor instead (no gh needed)?"):
+            return visitor(target, interactive=interactive, dry_run=dry_run)
         raise SetupError(
-            f"Missing: {', '.join(missing)}. Install with:  {how}\nthen run this again."
+            f"Missing: {', '.join(missing)}. Install with:  {how}\n"
+            "then run this again, or add --visitor (nothing to install)."
         )
-    say("git and gh: ready")
-    step(3, 4, "Sign in and download")
-    if dry_run:
-        say(f"(dry run) gh auth login, then gh repo clone {REPO} {target}")
-        return
+    good("git and gh are ready")
+    step(3, "Sign in to GitHub")
     login = ["gh", "auth", "login", "--web", "--git-protocol", "https"]
-    if run(["gh", "auth", "status"]) and run(login):
-        raise SetupError("The GitHub sign-in did not work.")
-    run(["gh", "auth", "setup-git"])
-    if run(["gh", "api", f"repos/{REPO}", "--jq", ".full_name"]):
+    clone = ["gh", "repo", "clone", REPO, str(target)]
+    pull = ["git", "-C", str(target), "pull", "--ff-only"]
+    if subprocess.run(["gh", "auth", "status"], **SILENT).returncode:
+        if dry_run:
+            say(f"(dry run) not signed in; would propose:  {' '.join(login)}")
+            say("(dry run) stops here: step 4 needs a signed-in gh.")
+            return
+        why = "A browser window opens: confirm the code GitHub shows there."
+        if propose(login, why, interactive=interactive) and run(login):
+            raise SetupError("The GitHub sign-in did not work.")
+        if subprocess.run(["gh", "auth", "status"], **SILENT).returncode:
+            raise SetupError("Not signed in to GitHub yet. Run the command above, then this again.")
+    good("Signed in to GitHub")
+    if not dry_run:
+        run_quiet(["gh", "auth", "setup-git"], "Connecting git to GitHub")
+    if run_quiet(["gh", "api", f"repos/{REPO}", "--jq", ".full_name"], "Checking your access"):
         raise SetupError(f"GitHub does not let you open {REPO}.\n{ACCESS_HELP}")
+    if dry_run:
+        step(4, "Download L'Usine")
+        say(f"(dry run) would propose:  {' '.join(pull if (target / '.git').is_dir() else clone)}")
+        return
+    step(4, "Download L'Usine")
     if (target / ".git").is_dir():
-        say("L'Usine is already here: updating it")
-        run(["git", "-C", str(target), "pull", "--ff-only"])
+        why = "L'Usine is already here: this brings it up to date."
+        if propose(pull, why, interactive=interactive):
+            run_quiet(pull, "Updating L'Usine")
     elif target.exists() and any(target.iterdir()):
         raise SetupError(f"The folder {target} exists and is not a clone. Use --dir.")
-    elif run(["gh", "repo", "clone", REPO, str(target)]):
-        raise SetupError("Could not clone L'Usine.")
+    else:
+        why = "This copies the private repository (a minute the first time)."
+        if propose(clone, why, interactive=interactive) and run_quiet(clone, "Cloning L'Usine"):
+            raise SetupError("Could not clone L'Usine.")
+        if not (target / ".git").is_dir():
+            raise SetupError("The clone is not there yet. Run the command above, then this again.")
 
 
 def choose_profile(asked: str | None, *, interactive: bool) -> str:
@@ -341,13 +664,14 @@ def choose_profile(asked: str | None, *, interactive: bool) -> str:
     if not interactive:
         return "developer" if default == "2" else "visitor"
     print(
-        "Who are you?\n\n"
-        "  1. Visitor: I just want to see it.\n"
-        "     Installs nothing but uv. You sign in to GitHub once with a code.\n\n"
-        "  2. Developer: I need to clone and have everything.\n"
-        "     L'Usine and the assets are git clones. Needs git and the GitHub tool (gh).\n"
+        f"\n  {paint('1', 'bold', 'cyan')}  {paint('Visitor', 'bold')}  "
+        f"{paint('(quickest)', 'green')}\n"
+        f"     I just want to see it. Nothing to install but uv; you sign in to GitHub once.\n\n"
+        f"  {paint('2', 'bold', 'cyan')}  {paint('Developer', 'bold')}\n"
+        "     I need to clone and have everything. Needs git and the GitHub tool (gh);\n"
+        "     missing ones can be installed for you.\n"
     )
-    choice = input(f"Your choice, 1 or 2 [{default}]: ").strip() or default
+    choice = input(f"  Your choice, 1 or 2 [{default}]: ").strip() or default
     return "developer" if choice == "2" else "visitor"
 
 
@@ -362,10 +686,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     interactive = not args.yes and sys.stdin.isatty()
     try:
-        step(1, 4, "Who are you?")
+        banner()
+        step(1, "Who are you?")
         profile = choose_profile(args.profile, interactive=interactive)
+        STEPS["total"] = 5 if profile == "developer" else 4
         target = args.dir.expanduser().resolve() / "lusine"
-        say(f"{profile.capitalize()}: L'Usine will live in {target}")
+        good(f"{profile.capitalize()}: L'Usine will live in {paint(str(target), 'cyan')}")
+        if not args.dry_run:
+            warm_up_python()
+        started = time.monotonic()
         (visitor if profile == "visitor" else developer)(
             target, interactive=interactive, dry_run=args.dry_run
         )
@@ -377,10 +706,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not credentials.exists():  # without it Streamlit asks for an e-mail and waits
             credentials.parent.mkdir(parents=True, exist_ok=True)
             credentials.write_text('[general]\nemail = ""\n', encoding="utf-8")
-        step(4, 4, "Start L'Usine")
+        step(STEPS["total"], "Start L'Usine")
+        prepare(target)
+        print()
+        box([f"Ready in {time.monotonic() - started:.0f}s", f"Folder: {target}"], color="green")
         if args.no_launch:
-            say(f"Ready. Start it later with:  cd {target}  then  uv run lusine")
+            say(f"Start it later with:  cd {target}  then  uv run lusine")
             return 0
+        print()
         say("Your browser opens in a moment. Keep this window open; close it to stop.")
         code = run([uv_binary(), "run", "lusine"], cwd=target)
         return 0 if code == 130 else code
