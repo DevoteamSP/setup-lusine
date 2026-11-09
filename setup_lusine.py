@@ -429,6 +429,17 @@ def get_token(*, interactive: bool) -> str:
 # --- download --------------------------------------------------------------------------------
 
 
+def parse_sha(body: str) -> str:
+    """The commit sha from the API reply: the JSON commit (what Accept: application/json gets)
+    or a bare sha. It goes into a URL, so anything else is refused."""
+    body = body.strip()
+    if body.startswith("{"):
+        body = str(json.loads(body).get("sha", ""))
+    if len(body) != 40 or any(c not in "0123456789abcdef" for c in body):
+        raise SetupError("GitHub did not return a commit id. Run this again.")
+    return body
+
+
 def download(target: Path, token: str) -> str:
     """Unpack the latest files of the repository into ``target`` (new or empty). Returns the sha."""
     archive = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
