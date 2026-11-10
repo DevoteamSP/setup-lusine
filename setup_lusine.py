@@ -1095,7 +1095,7 @@ def desktop_dir() -> Path:
 
 
 def shortcut_name() -> str:
-    return "L'Usine.cmd" if sys.platform == "win32" else "L'Usine.command"
+    return "Lusine.cmd" if sys.platform == "win32" else "Lusine.command"
 
 
 def shortcut_text(target: Path, uv: str) -> str:
