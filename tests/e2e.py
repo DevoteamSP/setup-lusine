@@ -100,7 +100,7 @@ def visitor() -> None:
     if not saved.is_file() or json.loads(saved.read_text())["token"] != state.token:
         problems.append("the token was not saved")
     if sys.platform in ("darwin", "win32"):  # the Desktop shortcut: where it goes, what it runs
-        name = "L'Usine.cmd" if sys.platform == "win32" else "L'Usine.command"
+        name = "Lusine.cmd" if sys.platform == "win32" else "Lusine.command"
         launcher = work / "Desktop" / name
         text = launcher.read_text(encoding="utf-8") if launcher.is_file() else ""
         # the script writes the resolved path (a runner's temp folder has a short 8.3 name too)

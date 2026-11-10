@@ -344,7 +344,7 @@ def test_the_mac_shortcut_goes_to_the_folder_then_runs_lusine(
     monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path))
     target = Path("/Users/me/dev/snow builders/lusine")
     file = setup.create_shortcut(target)
-    assert file == tmp_path / "L'Usine.command"
+    assert file == tmp_path / "Lusine.command"
     lines = file.read_text().splitlines()
     assert lines[0] == "#!/bin/bash"
     assert lines[1] == f"cd {shlex.quote(str(target))} || exit 1"
@@ -360,7 +360,7 @@ def test_the_windows_shortcut_is_a_cmd_file_with_crlf(
     monkeypatch.setattr(setup, "uv_binary", lambda: r"C:\Users\me\.local\bin\uv.exe")
     monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path))
     file = setup.create_shortcut(Path(r"C:\Users\me\dev\100%\lusine"))
-    assert file.name == "L'Usine.cmd"
+    assert file.name == "Lusine.cmd"
     raw = file.read_bytes().decode()
     assert "\r\n" in raw and "\n" not in raw.replace("\r\n", "")
     assert r'cd /d "C:\Users\me\dev\100%%\lusine"' in raw
@@ -382,7 +382,7 @@ def test_the_shortcut_is_offered_only_to_people_who_can_answer(
     assert len(asked) == 1 and not list(tmp_path.iterdir())  # they said no
     monkeypatch.setattr(setup, "ask_yes", lambda *_a, **_k: True)
     setup.offer_shortcut(tmp_path, interactive=True, force=False, skip=False)
-    assert (tmp_path / "L'Usine.command").is_file()
+    assert (tmp_path / "Lusine.command").is_file()
 
 
 def test_no_shortcut_on_other_systems(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
