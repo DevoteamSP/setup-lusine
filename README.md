@@ -18,6 +18,8 @@ Install `uv`, `git` and the GitHub CLI (`gh`), then run the same command and cho
 
 ## Options
 
-`--visitor`, `--developer`, `--dir <folder>` (default `~/dev/snow-builders`), `--yes`, `--dry-run`, `--no-launch`.
+`--visitor`, `--developer`, `--dir <folder>` (default `~/dev/snow-builders`), `--yes`, `--dry-run`, `--no-launch`, `--shortcut` / `--no-shortcut`.
+
+At the end, on macOS and Windows, the setup offers a shortcut on your Desktop (`L'Usine.command` or `L'Usine.cmd`): a double-click opens a terminal in the L'Usine folder and runs `uv run lusine`. Delete the file to remove it.
 
 The script is one standard-library Python file with no secret in it (the GitHub App client id is public by design).

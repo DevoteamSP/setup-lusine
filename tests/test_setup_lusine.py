@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import os
+import shlex
+import sys
 import tarfile
 import urllib.error
 from pathlib import Path
@@ -331,3 +334,92 @@ def test_progress_tells_speed_and_time_left(monkeypatch: pytest.MonkeyPatch) -> 
     task.progress(2_000_000, 10_000_000)
     assert task.fraction == pytest.approx(0.2)
     assert "2.0 of 10.0 MB" in task.detail and "MB/s" in task.detail
+
+
+def test_the_mac_shortcut_goes_to_the_folder_then_runs_lusine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(setup.sys, "platform", "darwin")
+    monkeypatch.setattr(setup, "uv_binary", lambda: "/Users/me/.local/bin/uv")
+    monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path))
+    target = Path("/Users/me/dev/snow builders/lusine")
+    file = setup.create_shortcut(target)
+    assert file == tmp_path / "L'Usine.command"
+    lines = file.read_text().splitlines()
+    assert lines[0] == "#!/bin/bash"
+    assert lines[1] == f"cd {shlex.quote(str(target))} || exit 1"
+    assert lines[2] == "/Users/me/.local/bin/uv run lusine"
+    if os.name != "nt":  # Windows files have no executable bit
+        assert file.stat().st_mode & 0o111  # a double-click needs it executable
+
+
+def test_the_windows_shortcut_is_a_cmd_file_with_crlf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(setup.sys, "platform", "win32")
+    monkeypatch.setattr(setup, "uv_binary", lambda: r"C:\Users\me\.local\bin\uv.exe")
+    monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path))
+    file = setup.create_shortcut(Path(r"C:\Users\me\dev\100%\lusine"))
+    assert file.name == "L'Usine.cmd"
+    raw = file.read_bytes().decode()
+    assert "\r\n" in raw and "\n" not in raw.replace("\r\n", "")
+    assert r'cd /d "C:\Users\me\dev\100%%\lusine"' in raw
+    assert r'"C:\Users\me\.local\bin\uv.exe" run lusine' in raw
+
+
+def test_the_shortcut_is_offered_only_to_people_who_can_answer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(setup.sys, "platform", "darwin")
+    monkeypatch.setattr(setup, "uv_binary", lambda: "uv")
+    monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path))
+    asked: list[str] = []
+    monkeypatch.setattr(setup, "ask_yes", lambda question, **_: asked.append(question) or False)
+    setup.offer_shortcut(tmp_path, interactive=False, force=False, skip=False)
+    setup.offer_shortcut(tmp_path, interactive=True, force=False, skip=True)
+    assert asked == [] and not list(tmp_path.iterdir())
+    setup.offer_shortcut(tmp_path, interactive=True, force=False, skip=False)
+    assert len(asked) == 1 and not list(tmp_path.iterdir())  # they said no
+    monkeypatch.setattr(setup, "ask_yes", lambda *_a, **_k: True)
+    setup.offer_shortcut(tmp_path, interactive=True, force=False, skip=False)
+    assert (tmp_path / "L'Usine.command").is_file()
+
+
+def test_no_shortcut_on_other_systems(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(setup.sys, "platform", "linux")
+    monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path))
+    setup.offer_shortcut(tmp_path, interactive=True, force=True, skip=False)
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_shortcut_that_cannot_be_written_does_not_stop_the_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setattr(setup.sys, "platform", "darwin")
+
+    def broken(_target: Path) -> Path:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(setup, "create_shortcut", broken)
+    setup.offer_shortcut(tmp_path, interactive=False, force=True, skip=False)
+    assert "No shortcut this time" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="runs the macOS launcher with bash")
+def test_the_mac_launcher_really_starts_uv_in_the_lusine_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import subprocess
+
+    fake_uv = tmp_path / "fake uv"
+    fake_uv.write_text('#!/bin/sh\necho "uv $* in $(pwd -P)"\n')
+    fake_uv.chmod(0o755)
+    target = tmp_path / "snow builders" / "lusine"
+    target.mkdir(parents=True)
+    monkeypatch.setattr(setup.sys, "platform", "darwin")
+    monkeypatch.setattr(setup, "uv_binary", lambda: str(fake_uv))
+    monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path / "Desktop"))
+    launcher = setup.create_shortcut(target)
+    done = subprocess.run([str(launcher)], capture_output=True, text=True, check=False)
+    assert done.returncode == 0
+    assert done.stdout.strip() == f"uv run lusine in {target.resolve()}"

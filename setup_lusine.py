@@ -25,6 +25,7 @@ import getpass
 import json
 import os
 import platform
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -1077,6 +1078,83 @@ def choose_profile(asked: str | None, *, interactive: bool) -> str:
     return "developer" if choice == "2" else "visitor"
 
 
+def desktop_dir() -> Path:
+    """The Desktop folder: ``LUSINE_DESKTOP`` (tests), else where Windows or macOS keeps it."""
+    if os.environ.get("LUSINE_DESKTOP"):
+        return Path(os.environ["LUSINE_DESKTOP"])
+    if sys.platform == "win32":
+        try:  # the real folder, also when OneDrive or the company moved it
+            import winreg
+
+            key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as handle:
+                return Path(str(winreg.QueryValueEx(handle, "Desktop")[0]))
+        except (ImportError, OSError):
+            pass
+    return Path.home() / "Desktop"
+
+
+def shortcut_name() -> str:
+    return "L'Usine.cmd" if sys.platform == "win32" else "L'Usine.command"
+
+
+def shortcut_text(target: Path, uv: str) -> str:
+    """What a double-click runs: go to the L'Usine folder, then ``uv run lusine``."""
+    if sys.platform == "win32":
+        folder, tool = str(target).replace("%", "%%"), uv.replace("%", "%%")
+        lines = [
+            "@echo off",
+            "chcp 65001 >nul",  # folders with accents in the user name
+            "title L'Usine",
+            f'cd /d "{folder}"',
+            f'"{tool}" run lusine',
+            "if errorlevel 1 pause",  # keep the window open when something went wrong
+        ]
+        return "\r\n".join(lines) + "\r\n"
+    lines = [
+        "#!/bin/bash",
+        f"cd {shlex.quote(str(target))} || exit 1",
+        f"{shlex.quote(uv)} run lusine",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def create_shortcut(target: Path) -> Path:
+    """Write the launcher on the Desktop (a .command file on macOS, a .cmd file on Windows)."""
+    folder = desktop_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    file = folder / shortcut_name()
+    file.write_text(shortcut_text(target, uv_binary()), encoding="utf-8", newline="")
+    if sys.platform != "win32":
+        file.chmod(0o755)  # a double-click only opens what is executable
+    return file
+
+
+def offer_shortcut(target: Path, *, interactive: bool, force: bool, skip: bool) -> None:
+    """Before L'Usine starts: offer a Desktop shortcut for the next time (macOS and Windows)."""
+    if skip or sys.platform not in ("darwin", "win32") or not (interactive or force):
+        return
+    if not force:
+        print()
+        explain(
+            "One more thing",
+            [
+                "Next time, you can start L'Usine with a double-click. I can put a shortcut on "
+                "your Desktop: it opens a terminal in the L'Usine folder and runs "
+                "`uv run lusine` for you.",
+            ],
+            tip="To remove it later, just delete the file: nothing else is touched.",
+        )
+        if not ask_yes("Put a shortcut on your Desktop?"):
+            return
+    try:
+        file = create_shortcut(target)
+    except (OSError, SetupError) as exc:
+        warn(f"No shortcut this time ({exc}). Start L'Usine with: cd {target}  then  uv run lusine")
+        return
+    good(f"Shortcut created: {paint(str(file), 'cyan')}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="setup_lusine", description="Set up L'Usine.")
     parser.add_argument("--visitor", dest="profile", action="store_const", const="visitor")
@@ -1085,6 +1163,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true", help="take every default, never ask")
     parser.add_argument("--dry-run", action="store_true", help="say what would change")
     parser.add_argument("--no-launch", action="store_true", help="stop before starting L'Usine")
+    parser.add_argument(
+        "--shortcut", action="store_true", help="add a Desktop shortcut, no question"
+    )
+    parser.add_argument(
+        "--no-shortcut", action="store_true", help="do not offer a Desktop shortcut"
+    )
     args = parser.parse_args(argv)
     interactive = not args.yes and sys.stdin.isatty()
     os.environ.pop("VIRTUAL_ENV", None)  # the one of this script, not of L'Usine
@@ -1151,6 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             show(window("All done", rows, color="green"))
         else:
             box([f"Ready in {took}", f"Folder: {target}"], color="green")
+        offer_shortcut(target, interactive=interactive, force=args.shortcut, skip=args.no_shortcut)
         if args.no_launch:
             say(f"Start it later with:  {later}")
             return 0
