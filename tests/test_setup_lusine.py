@@ -229,3 +229,34 @@ def test_when_windows_gives_no_roots_the_original_error_comes_up(
     monkeypatch.setattr(setup, "fetch_windows_roots", lambda: None)
     with pytest.raises(urllib.error.URLError):
         setup._open("https://api.github.com/user")
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "machine", "x64"),
+    [
+        ("win32", "ARM64", True),
+        ("win32", "AMD64", False),
+        ("darwin", "arm64", False),
+        ("linux", "aarch64", False),
+    ],
+)
+def test_only_windows_on_arm_syncs_with_the_x64_python(
+    monkeypatch: pytest.MonkeyPatch, platform_name: str, machine: str, x64: bool
+) -> None:
+    monkeypatch.setattr(setup.sys, "platform", platform_name)
+    monkeypatch.setattr(setup.platform, "machine", lambda: machine)
+    monkeypatch.setattr(setup, "uv_binary", lambda: "uv")
+    command = setup.sync_command()
+    assert command[:2] == ["uv", "sync"]
+    assert ("--python" in command) is x64
+    if x64:
+        assert command[-1] == "cpython-3.12-windows-x86_64-none"
+
+
+def test_a_failed_library_install_stops_the_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(setup, "run_quiet", lambda *a, **k: 1)
+    monkeypatch.setattr(setup, "uv_binary", lambda: "uv")
+    with pytest.raises(setup.SetupError, match="libraries could not be installed"):
+        setup.prepare(tmp_path)

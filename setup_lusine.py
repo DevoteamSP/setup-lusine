@@ -25,6 +25,7 @@ import getpass
 import itertools
 import json
 import os
+import platform
 import shutil
 import ssl
 import subprocess
@@ -618,10 +619,30 @@ def warm_up_python() -> None:
     threading.Thread(target=work, daemon=True).start()
 
 
+def windows_on_arm() -> bool:
+    return sys.platform == "win32" and platform.machine().upper() in ("ARM64", "AARCH64")
+
+
+def sync_command() -> list[str]:
+    """``uv sync``, with the x64 Python on Windows for ARM.
+
+    Libraries such as httptools (needed by Streamlit) have no prebuilt Windows ARM64 package, so
+    uv would compile them and ask for the Microsoft C++ build tools. Windows 11 on ARM runs x64
+    programs, and every library has a prebuilt x64 package.
+    """
+    command = [uv_binary(), "sync"]
+    if windows_on_arm():
+        command += ["--python", "cpython-3.12-windows-x86_64-none"]
+    return command
+
+
 def prepare(target: Path) -> None:
     """Install the libraries now, behind a progress line, so that the first start is instant."""
-    if run_quiet([uv_binary(), "sync"], "Installing the libraries", cwd=target):
-        warn("Not finished: the first start will install the rest.")
+    if run_quiet(sync_command(), "Installing the libraries", cwd=target):
+        raise SetupError(
+            "The libraries could not be installed (the lines above say why). Run this again;\n"
+            "if it keeps failing, send those lines to the DSP team."
+        )
 
 
 def visitor(target: Path, *, interactive: bool, dry_run: bool) -> None:
@@ -782,6 +803,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-launch", action="store_true", help="stop before starting L'Usine")
     args = parser.parse_args(argv)
     interactive = not args.yes and sys.stdin.isatty()
+    os.environ.pop("VIRTUAL_ENV", None)  # the one of this script, not of L'Usine
     if sys.platform == "win32":  # uv too must trust the certificates Windows trusts
         os.environ.setdefault("UV_NATIVE_TLS", "1")
         os.environ.setdefault("UV_SYSTEM_CERTS", "1")
