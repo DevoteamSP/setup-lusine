@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -146,3 +147,85 @@ def test_parse_sha_accepts_a_bare_sha() -> None:
 def test_parse_sha_refuses_anything_else() -> None:
     with pytest.raises(setup.SetupError):
         setup.parse_sha("<html>rate limited</html>")
+
+
+def test_on_windows_the_certificates_of_the_system_store_are_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behind a company proxy the root certificate lives in the Windows store, not in Python."""
+    import ssl
+
+    loaded: list[bytes] = []
+    stores: list[str] = []
+
+    def enum(store: str) -> list[tuple[bytes, str, bool]]:
+        stores.append(store)
+        return [(b"der-" + store.encode(), "x509_asn", True), (b"crl", "pkcs_7_asn", True)]
+
+    class Context:
+        def load_verify_locations(self, *, cadata: bytes) -> None:
+            loaded.append(cadata)
+
+    monkeypatch.setattr(setup.sys, "platform", "win32")
+    monkeypatch.setattr(ssl, "enum_certificates", enum, raising=False)
+    monkeypatch.setattr(ssl, "create_default_context", lambda: Context())
+    setup.ssl_context.cache_clear()
+    try:
+        setup.ssl_context()
+    finally:
+        setup.ssl_context.cache_clear()
+    assert stores == ["ROOT", "CA"]
+    assert loaded == [b"der-ROOT", b"der-CA"]
+
+
+def _untrusted() -> urllib.error.URLError:
+    import ssl
+
+    return urllib.error.URLError(ssl.SSLCertVerificationError("unable to get local issuer"))
+
+
+def test_on_windows_a_missing_root_is_fetched_once_and_the_request_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pem = tmp_path / "roots.pem"
+    contexts: list[object] = []
+
+    def urlopen(_request, timeout, context):
+        contexts.append(context)
+        if len(contexts) == 1:
+            raise _untrusted()
+        return "reply"
+
+    monkeypatch.setattr(setup.sys, "platform", "win32")
+    monkeypatch.setattr(setup.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(setup, "fetch_windows_roots", lambda: pem)
+    monkeypatch.setattr(setup, "ssl_context", lambda extra=None: ("context", extra))
+    assert setup._open("https://api.github.com/user") == "reply"
+    assert contexts == [("context", None), ("context", pem)]
+
+
+def test_elsewhere_a_certificate_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    def urlopen(_request, timeout, context):
+        calls.append(1)
+        raise _untrusted()
+
+    monkeypatch.setattr(setup.sys, "platform", "linux")
+    monkeypatch.setattr(setup.urllib.request, "urlopen", urlopen)
+    with pytest.raises(urllib.error.URLError):
+        setup._open("https://api.github.com/user")
+    assert calls == [1]
+
+
+def test_when_windows_gives_no_roots_the_original_error_comes_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def urlopen(_request, timeout, context):
+        raise _untrusted()
+
+    monkeypatch.setattr(setup.sys, "platform", "win32")
+    monkeypatch.setattr(setup.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(setup, "fetch_windows_roots", lambda: None)
+    with pytest.raises(urllib.error.URLError):
+        setup._open("https://api.github.com/user")
