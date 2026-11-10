@@ -60,6 +60,7 @@ def preview() -> None:
         "LUSINE_GITHUB_CLIENT_ID": "preview",
         "LUSINE_HOME": str(work / "home"),
         "BROWSER": "true",  # do not open a real browser
+        "LUSINE_DESKTOP": str(work / "Desktop"),  # not your real Desktop
     }
     for name in ("LUSINE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         env.pop(name, None)
@@ -81,10 +82,11 @@ def visitor() -> None:
         "LUSINE_GITHUB_WEB": url,
         "LUSINE_HOME": str(home),
         "LUSINE_TOKEN": state.token,
+        "LUSINE_DESKTOP": str(work / "Desktop"),
         "PYTHONUTF8": "1",
     }
     command = ["uv", "run", str(ROOT / "setup_lusine.py")]
-    command += ["--visitor", "--yes", "--no-launch", "--dir", str(work / "files")]
+    command += ["--visitor", "--yes", "--no-launch", "--shortcut", "--dir", str(work / "files")]
     done = subprocess.run(command, env=env, check=False)
     server.shutdown()
     target = work / "files" / "lusine"
@@ -97,6 +99,12 @@ def visitor() -> None:
     saved = home / "github_token.json"
     if not saved.is_file() or json.loads(saved.read_text())["token"] != state.token:
         problems.append("the token was not saved")
+    if sys.platform in ("darwin", "win32"):  # the Desktop shortcut: where it goes, what it runs
+        name = "L'Usine.cmd" if sys.platform == "win32" else "L'Usine.command"
+        launcher = work / "Desktop" / name
+        text = launcher.read_text(encoding="utf-8") if launcher.is_file() else ""
+        if str(target) not in text or "run lusine" not in text:
+            problems.append("the Desktop shortcut is missing or does not start L'Usine")
     if not (home / "install-mode").read_text().startswith("visitor"):
         problems.append("the profile was not remembered")
     if problems:
