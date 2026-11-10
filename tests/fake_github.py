@@ -93,6 +93,8 @@ def _handler(state: FakeGitHub) -> type[BaseHTTPRequestHandler]:
                     200, {"full_name": repo, "permissions": {"push": state.can_push}}
                 )
             if parts[3:] == ["commits", "HEAD"]:
+                if "json" in self.headers.get("Accept", ""):  # what the real API sends back
+                    return self._json(200, {"sha": state.sha, "commit": {"message": "{x}"}})
                 return self._send(200, state.sha.encode(), "text/plain")
             if parts[3] == "contents":
                 rel = "/".join(parts[4:])

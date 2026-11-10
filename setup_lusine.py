@@ -150,7 +150,13 @@ def box(lines: Sequence[str], *, color: str = "cyan", indent: int = 2) -> None:
 
 def banner() -> None:
     print()
-    box(["L'USINE  -  Snow Builders", "Devoteam Snowflake Partner"])
+    box(
+        [
+            "L'USINE  -  where data gets its hard hat",
+            "Snow Builders, Devoteam Snowflake Partner",
+            "No snowflakes were harmed in this setup.",
+        ]
+    )
 
 
 STEPS = {"total": 0}  # set once the profile is known: visitor 4 steps, developer 5
@@ -446,7 +452,7 @@ def download(target: Path, token: str) -> str:
     try:
         with Task("Downloading L'Usine") as task, archive:
             with _open(f"{API}/repos/{REPO}/commits/HEAD", token=token) as reply:
-                sha = reply.read().decode().strip()
+                sha = parse_sha(reply.read().decode())
             with _open(f"{API}/repos/{REPO}/tarball/{sha}", token=token) as reply:
                 total = int(reply.headers.get("Content-Length") or 0) or None
                 done = 0
@@ -675,14 +681,15 @@ def choose_profile(asked: str | None, *, interactive: bool) -> str:
     if not interactive:
         return "developer" if default == "2" else "visitor"
     print(
-        f"\n  {paint('1', 'bold', 'cyan')}  {paint('Visitor', 'bold')}  "
+        f"\n      {paint('1', 'bold', 'cyan')}   {paint('Visitor', 'bold')}  "
         f"{paint('(quickest)', 'green')}\n"
-        f"     I just want to see it. Nothing to install but uv; you sign in to GitHub once.\n\n"
-        f"  {paint('2', 'bold', 'cyan')}  {paint('Developer', 'bold')}\n"
-        "     I need to clone and have everything. Needs git and the GitHub tool (gh);\n"
-        "     missing ones can be installed for you.\n"
+        "          I just want to see it. Nothing to install but uv;\n"
+        "          you sign in to GitHub once.\n\n"
+        f"      {paint('2', 'bold', 'cyan')}   {paint('Developer', 'bold')}\n"
+        "          I need to clone and have everything. Needs git and the GitHub tool (gh);\n"
+        "          missing ones can be installed for you.\n"
     )
-    choice = input(f"  Your choice, 1 or 2 [{default}]: ").strip() or default
+    choice = input(f"      Your choice, 1 or 2 [{default}]: ").strip() or default
     return "developer" if choice == "2" else "visitor"
 
 
