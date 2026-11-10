@@ -89,9 +89,7 @@ def _handler(state: FakeGitHub) -> type[BaseHTTPRequestHandler]:
                 return self._json(404, {"message": "Not Found"})
             repo = "/".join(parts[1:3])
             if len(parts) == 3:
-                return self._json(
-                    200, {"full_name": repo, "permissions": {"push": state.can_push}}
-                )
+                return self._json(200, {"full_name": repo, "permissions": {"push": state.can_push}})
             if parts[3:] == ["commits", "HEAD"]:
                 if "json" in self.headers.get("Accept", ""):  # what the real API sends back
                     return self._json(200, {"sha": state.sha, "commit": {"message": "{x}"}})
@@ -160,9 +158,7 @@ def _handler(state: FakeGitHub) -> type[BaseHTTPRequestHandler]:
             if path == "/login/device/code":
                 if state.code_error:
                     why = f"{state.code_error} (test)"
-                    return self._json(
-                        200, {"error": state.code_error, "error_description": why}
-                    )
+                    return self._json(200, {"error": state.code_error, "error_description": why})
                 return self._json(
                     200,
                     {

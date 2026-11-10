@@ -146,3 +146,32 @@ def test_parse_sha_accepts_a_bare_sha() -> None:
 def test_parse_sha_refuses_anything_else() -> None:
     with pytest.raises(setup.SetupError):
         setup.parse_sha("<html>rate limited</html>")
+
+
+def test_on_windows_the_certificates_of_the_system_store_are_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behind a company proxy the root certificate lives in the Windows store, not in Python."""
+    import ssl
+
+    loaded: list[bytes] = []
+    stores: list[str] = []
+
+    def enum(store: str) -> list[tuple[bytes, str, bool]]:
+        stores.append(store)
+        return [(b"der-" + store.encode(), "x509_asn", True), (b"crl", "pkcs_7_asn", True)]
+
+    class Context:
+        def load_verify_locations(self, *, cadata: bytes) -> None:
+            loaded.append(cadata)
+
+    monkeypatch.setattr(setup.sys, "platform", "win32")
+    monkeypatch.setattr(ssl, "enum_certificates", enum, raising=False)
+    monkeypatch.setattr(ssl, "create_default_context", lambda: Context())
+    setup.ssl_context.cache_clear()
+    try:
+        setup.ssl_context()
+    finally:
+        setup.ssl_context.cache_clear()
+    assert stores == ["ROOT", "CA"]
+    assert loaded == [b"der-ROOT", b"der-CA"]

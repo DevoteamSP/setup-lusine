@@ -26,6 +26,7 @@ import itertools
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -293,12 +294,44 @@ def copy_to_clipboard(text: str) -> bool:
 # --- GitHub ----------------------------------------------------------------------------------
 
 
+@functools.cache
+def ssl_context() -> ssl.SSLContext:
+    """Python's default certificates, plus the ones Windows trusts.
+
+    The Python that uv brings ignores the Windows certificate store. Behind a company proxy that
+    re-signs HTTPS with its own root certificate, GitHub then fails with CERTIFICATE_VERIFY_FAILED
+    although the browser works. Reading the store (ROOT and CA) fixes that without turning the
+    verification off.
+    """
+    context = ssl.create_default_context()
+    if sys.platform == "win32":
+        for store in ("ROOT", "CA"):
+            try:
+                certificates = ssl.enum_certificates(store)
+            except OSError:
+                continue
+            for der, kind, _trust in certificates:
+                if kind == "x509_asn":
+                    try:
+                        context.load_verify_locations(cadata=der)
+                    except ssl.SSLError:
+                        pass  # an unusable certificate in the store: ignore it
+    return context
+
+
 def _open(url: str, *, data: dict[str, str] | None = None, token: str | None = None):
     headers = {"Accept": "application/json", "User-Agent": "setup-lusine"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     body = urllib.parse.urlencode(data).encode() if data is not None else None
-    return urllib.request.urlopen(urllib.request.Request(url, body, headers), timeout=60)
+    request = urllib.request.Request(url, body, headers)
+    return urllib.request.urlopen(request, timeout=60, context=ssl_context())
+
+
+NETWORK_HELP = (
+    "Check your connection. If it says CERTIFICATE_VERIFY_FAILED, a company proxy is "
+    "re-signing HTTPS: ask IT for the root certificate and set SSL_CERT_FILE to its .pem file."
+)
 
 
 def _post_json(url: str, data: dict[str, str]) -> dict:
@@ -306,7 +339,7 @@ def _post_json(url: str, data: dict[str, str]) -> dict:
         with _open(url, data=data) as reply:
             return json.loads(reply.read().decode())
     except urllib.error.URLError as exc:
-        raise SetupError(f"Could not reach GitHub ({exc.reason}). Check your connection.") from exc
+        raise SetupError(f"Could not reach GitHub ({exc.reason}). {NETWORK_HELP}") from exc
 
 
 def repo_status(token: str) -> int:
@@ -703,6 +736,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-launch", action="store_true", help="stop before starting L'Usine")
     args = parser.parse_args(argv)
     interactive = not args.yes and sys.stdin.isatty()
+    if sys.platform == "win32":  # uv too must trust the certificates Windows trusts
+        os.environ.setdefault("UV_NATIVE_TLS", "1")
+        os.environ.setdefault("UV_SYSTEM_CERTS", "1")
     try:
         banner()
         step(1, "Who are you?")
