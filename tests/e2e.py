@@ -46,6 +46,30 @@ FILES = {
 }
 
 
+def preview() -> None:
+    """The setup in your own terminal against the fake GitHub, slowed down to watch the screen."""
+    files = {**FILES, "pad.bin": os.urandom(12 * 1024 * 1024)}
+    state = FakeGitHub(repos={REPO: files}, throttle=0.06, pending_polls=3, device_interval=2)
+    server, url = serve(state)
+    work = Path(tempfile.mkdtemp(prefix="sl-preview-"))
+    env = {
+        **os.environ,
+        "LUSINE_REPO_SLUG": REPO,
+        "LUSINE_GITHUB_API": url,
+        "LUSINE_GITHUB_WEB": url,
+        "LUSINE_GITHUB_CLIENT_ID": "preview",
+        "LUSINE_HOME": str(work / "home"),
+        "BROWSER": "true",  # do not open a real browser
+        "LUSINE_DESKTOP": str(work / "Desktop"),  # not your real Desktop
+    }
+    for name in ("LUSINE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        env.pop(name, None)
+    command = ["uv", "run", str(ROOT / "setup_lusine.py"), "--no-launch"]
+    command += ["--dir", str(work / "files"), *sys.argv[2:]]
+    subprocess.run(command, env=env, check=False)
+    server.shutdown()
+
+
 def visitor() -> None:
     state = FakeGitHub(repos={REPO: FILES})
     server, url = serve(state)
@@ -58,10 +82,11 @@ def visitor() -> None:
         "LUSINE_GITHUB_WEB": url,
         "LUSINE_HOME": str(home),
         "LUSINE_TOKEN": state.token,
+        "LUSINE_DESKTOP": str(work / "Desktop"),
         "PYTHONUTF8": "1",
     }
     command = ["uv", "run", str(ROOT / "setup_lusine.py")]
-    command += ["--visitor", "--yes", "--no-launch", "--dir", str(work / "files")]
+    command += ["--visitor", "--yes", "--no-launch", "--shortcut", "--dir", str(work / "files")]
     done = subprocess.run(command, env=env, check=False)
     server.shutdown()
     target = work / "files" / "lusine"
@@ -74,6 +99,13 @@ def visitor() -> None:
     saved = home / "github_token.json"
     if not saved.is_file() or json.loads(saved.read_text())["token"] != state.token:
         problems.append("the token was not saved")
+    if sys.platform in ("darwin", "win32"):  # the Desktop shortcut: where it goes, what it runs
+        name = "L'Usine.cmd" if sys.platform == "win32" else "L'Usine.command"
+        launcher = work / "Desktop" / name
+        text = launcher.read_text(encoding="utf-8") if launcher.is_file() else ""
+        # the script writes the resolved path (a runner's temp folder has a short 8.3 name too)
+        if str(target.resolve()) not in text or "run lusine" not in text:
+            problems.append("the Desktop shortcut is missing or does not start L'Usine")
     if not (home / "install-mode").read_text().startswith("visitor"):
         problems.append("the profile was not remembered")
     if problems:
@@ -99,5 +131,7 @@ def developer(target: Path) -> None:
 if __name__ == "__main__":
     if sys.argv[1] == "visitor":
         visitor()
+    elif sys.argv[1] == "preview":
+        preview()
     else:
         developer(Path(sys.argv[2]))

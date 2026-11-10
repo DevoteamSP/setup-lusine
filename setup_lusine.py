@@ -22,16 +22,17 @@ from __future__ import annotations
 import argparse
 import functools
 import getpass
-import itertools
 import json
 import os
 import platform
+import shlex
 import shutil
 import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.error
@@ -75,17 +76,27 @@ class SetupError(Exception):
 # --- terminal ---------------------------------------------------------------------------------
 # Standard library only, and ASCII in this file: the fancy glyphs are written as escapes. When the
 # output is not a terminal (a pipe, CI, NO_COLOR) everything falls back to plain text.
+#
+# The look: every step opens with a "window" that says what is about to happen (and why), long
+# jobs run inside a live window (spinner, progress bar, last log line, a rotating tip) that folds
+# into a single tick when the job is done.
 
 _UNICODE = {
     "ok": "\u2714", "bad": "\u2716", "warn": "!", "dot": "\u25cf", "on": "\u2588", "off": "\u2591",
     "h": "\u2500", "v": "\u2502", "tl": "\u256d", "tr": "\u256e", "bl": "\u2570", "br": "\u256f",
     "frames": "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f",
+    "arrow": "\u25b8", "sep": "\u00b7", "s_done": "\u2714", "s_now": "\u25cf", "s_next": "\u25cb",
+    "eighths": " \u258f\u258e\u258d\u258c\u258b\u258a\u2589",
+    "pulse": "\u2592\u2593\u2588\u2593\u2592", "cut": "\u2026",
 }  # fmt: skip
 _PLAIN = {
     "ok": "[ok]", "bad": "[!!]", "warn": "[!]", "dot": "*", "on": "#", "off": "-",
     "h": "-", "v": "|", "tl": "+", "tr": "+", "bl": "+", "br": "+", "frames": "|/-\\",
+    "arrow": ">", "sep": "-", "s_done": "[x]", "s_now": "[*]", "s_next": "[ ]",
+    "eighths": " ", "pulse": "#####", "cut": "~",
 }  # fmt: skip
 STYLES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+Parts = list[tuple[str, str]]  # a row of text: (text, "bold cyan") pieces
 
 
 @functools.cache
@@ -118,7 +129,7 @@ def g(name: str) -> str:
 
 
 def paint(text: str, *styles: str) -> str:
-    if not fancy():
+    if not fancy() or not styles:
         return text
     codes = ";".join(STYLES[style] for style in styles)
     return f"\x1b[{codes}m{text}\x1b[0m"
@@ -126,6 +137,11 @@ def paint(text: str, *styles: str) -> str:
 
 def width() -> int:
     return max(40, min(shutil.get_terminal_size((80, 24)).columns, 100))
+
+
+def box_width() -> int:
+    """Outer width of a window: a 2-column margin on each side, at most 90 wide."""
+    return min(width(), 90) - 4
 
 
 def say(text: str = "") -> None:
@@ -138,6 +154,74 @@ def good(text: str) -> None:
 
 def warn(text: str) -> None:
     print(f"  {paint(g('warn'), 'yellow', 'bold')} {text}")
+
+
+def clock(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}" if seconds >= 60 else f"{seconds}s"
+
+
+def fit(parts: Parts, room: int, *, pad: bool = True) -> str:
+    """Styled text cut (and, by default, padded) to exactly ``room`` visible columns."""
+    out, used = [], 0
+    for text, style in parts:
+        piece = text[: max(0, room - used)]
+        if len(piece) < len(text) and room > 1:  # cut: say so with an ellipsis
+            piece = piece[:-1] + g("cut")
+        used += len(piece)
+        if piece:
+            out.append(paint(piece, *style.split()))
+    return "".join(out) + (" " * (room - used) if pad else "")
+
+
+def wrap(text: str, room: int) -> list[str]:
+    return textwrap.wrap(text, max(10, room)) or [""]
+
+
+def window(title: str, rows: list[Parts], *, color: str = "cyan") -> list[str]:
+    """A rounded window as a list of lines (no margin): a title in the top edge, one row each."""
+    total = box_width()
+    inner = total - 4
+    label = f" {title[: total - 6]} " if title else ""
+    edge = paint(g("tl") + g("h"), color)
+    top = edge + paint(label, "bold") + paint(g("h") * (total - 3 - len(label)) + g("tr"), color)
+    side = paint(g("v"), color)
+    lines = [top]
+    lines += [f"{side} {fit(row, inner)} {side}" for row in rows]
+    lines.append(paint(g("bl") + g("h") * (total - 2) + g("br"), color))
+    return lines
+
+
+def show(lines: Sequence[str], *, indent: int = 2, file=None) -> None:
+    for line in lines:
+        print(" " * indent + line, file=file)
+
+
+def paragraphs(texts: Sequence[str]) -> list[Parts]:
+    rows: list[Parts] = []
+    for text in texts:
+        if rows:
+            rows.append([])
+        rows += [[(line, "")] for line in wrap(text, box_width() - 4)]
+    return rows
+
+
+def explain(title: str, why: Sequence[str] | str, *, tip: str = "", color: str = "cyan") -> None:
+    """A window that says what is about to happen (plain text when there is no terminal)."""
+    texts = [why] if isinstance(why, str) else list(why)
+    if not fancy():
+        print(f"  == {title} ==")
+        for text in texts:
+            for line in wrap(text, 72):
+                print(f"    {line}")
+        if tip:
+            print(f"    Tip: {tip}")
+        return
+    rows = paragraphs(texts)
+    if tip:
+        tips = wrap("Tip: " + tip, box_width() - 4)
+        rows += [[], *[[(line, "dim")] for line in tips]]
+    show(window(title, rows, color=color))
 
 
 def box(lines: Sequence[str], *, color: str = "cyan", indent: int = 2) -> None:
@@ -161,13 +245,34 @@ def banner() -> None:
     )
 
 
-STEPS = {"total": 0}  # set once the profile is known: visitor 4 steps, developer 5
+STEPS: dict = {"total": 0, "names": []}  # set once the profile is known
 
 
-def step(number: int, title: str) -> None:
-    label = f" {number}/{STEPS['total']} " if STEPS["total"] else f" {number} "
-    rule = g("h") * max(4, width() - len(label) - len(title) - 6)
-    print(f"\n  {paint(label, 'bold', 'cyan')} {paint(title, 'bold')} {paint(rule, 'dim')}")
+def stepper(current: int) -> str:
+    """The road map in one line: what is done, where we are, what is left."""
+    parts: Parts = [("  ", "")]
+    names = STEPS["names"]
+    for number, name in enumerate(names, 1):
+        if number < current:
+            parts += [(g("s_done") + " ", "green"), (name, "green")]
+        elif number == current:
+            parts += [(g("s_now") + " ", "cyan bold"), (name, "bold")]
+        else:
+            parts += [(g("s_next") + " ", "dim"), (name, "dim")]
+        if number < len(names):
+            parts.append((f" {g('h') * 3} ", "dim"))
+    return fit(parts, width(), pad=False)
+
+
+def step(number: int, title: str, why: Sequence[str] | str = "", tip: str = "") -> None:
+    total = STEPS["total"]
+    print()
+    if STEPS["names"]:
+        print(stepper(number))
+    head = f"Step {number}/{total}" if total else f"Step {number}"
+    explain(f"{head} {g('sep')} {title}", why, tip=tip) if why else print(
+        f"  {paint(head, 'bold', 'cyan')} {paint(title, 'bold')}"
+    )
 
 
 def ask_yes(question: str, *, default: bool = True) -> bool:
@@ -181,8 +286,14 @@ def propose(command: Sequence[str], why: str, *, interactive: bool) -> bool:
     Returns True when this script ran it, False when the person said they would (or did).
     """
     shown = " ".join(f'"{part}"' if " " in part else part for part in command)
-    say(why)
-    print(f"\n      {paint('$', 'dim')} {paint(shown, 'bold', 'cyan')}\n")
+    if fancy():
+        rows = [*paragraphs([why]), [], [("$ ", "dim"), (shown, "bold cyan")]]
+        print()
+        show(window("The command", rows, color="yellow"))
+        print()
+    else:
+        say(why)
+        print(f"\n      $ {shown}\n")
     if not interactive or ask_yes("Run it for you?"):
         return True
     say("Run it in another window, then come back here.")
@@ -190,43 +301,111 @@ def propose(command: Sequence[str], why: str, *, interactive: bool) -> bool:
     return False
 
 
-class Task:
-    """One line that spins while work goes on, then settles into a tick (or a cross) and a time.
+def bar_parts(fraction: float, cells: int) -> Parts:
+    """A progress bar with eighth-of-a-cell steps; green once it is full."""
+    fraction = min(1.0, max(0.0, fraction))
+    if not fancy():
+        full = int(fraction * cells)
+        return [("#" * full + "-" * (cells - full), "")]
+    full, part = divmod(round(fraction * cells * 8), 8)
+    head = g("on") * full + (g("eighths")[part] if part and full < cells else "")
+    return [(head, "green" if fraction >= 1 else "cyan"), (g("off") * (cells - len(head)), "dim")]
 
-    Set ``detail`` from the work to show progress next to the label; ``failed`` for a cross.
+
+def marquee_parts(tick: int, cells: int) -> Parts:
+    """When nobody knows how long it takes: a light that sweeps to and fro."""
+    pulse = g("pulse")
+    span = max(1, cells - len(pulse))
+    where = tick % (2 * span)
+    where = where if where <= span else 2 * span - where
+    track = g("off") if fancy() else "-"
+    return [(track * where, "dim"), (pulse, "cyan"), (track * (span - where), "dim")]
+
+
+class Task:
+    """A job in a live window: spinner, progress bar, last log line and a rotating tip.
+
+    Set ``fraction`` (0 to 1) and ``detail`` from the work, or call ``progress(done, total)``;
+    with no fraction the bar is a sweeping light. ``log`` is the line shown under the bar.
+    When the job ends the window folds into one line: a tick (or a cross), the label, the time.
     """
 
-    def __init__(self, label: str) -> None:
+    TIP_SECONDS = 7
+
+    def __init__(self, label: str, *, tips: Sequence[str] = (), log: bool = False) -> None:
         self.label = label
         self.detail = ""
+        self.result = ""
+        self.log = ""
+        self.fraction: float | None = None
+        self.percent = True
         self.failed = False
+        self.tips = list(tips)
+        self.show_log = log
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._started = 0.0
+        self._height = 0
+        self._mark = (0.0, 0)
+        self._speed = 0.0
 
     def progress(self, done: int, total: int | None) -> None:
-        mb = f"{done / 1e6:.1f} MB"
+        now = time.monotonic()
+        before, then = self._mark
+        if now - before >= 0.5:
+            speed = (done - then) / (now - before)
+            self._speed = speed if not self._speed else 0.7 * self._speed + 0.3 * speed
+            self._mark = (now, done)
+        rate = f"  {self._speed / 1e6:.1f} MB/s" if self._speed else ""
         if not total:
-            self.detail = mb
+            self.fraction, self.detail = None, f"{done / 1e6:.1f} MB{rate}"
             return
-        cells = 20
-        filled = min(cells, done * cells // total)
-        bar = g("on") * filled + g("off") * (cells - filled)
-        self.detail = f"{bar} {done * 100 // total:3d}%  {mb}"
+        self.fraction = done / total
+        eta = f"  about {clock((total - done) / self._speed)} left" if self._speed else ""
+        self.detail = f"{done / 1e6:.1f} of {total / 1e6:.1f} MB{rate}{eta}"
+        self.result = f"{total / 1e6:.1f} MB"
+
+    def _frame(self, tick: int) -> list[str]:
+        inner = box_width() - 4
+        spinner = g("frames")[tick % len(g("frames"))]
+        elapsed = clock(time.monotonic() - self._started)
+        left = [(spinner + " ", "cyan bold"), (self.label, "bold")]
+        gap = max(1, inner - len(self.label) - 2 - len(elapsed))
+        rows: list[Parts] = [[*left, (" " * gap, ""), (elapsed, "dim")]]
+        cells = max(10, min(40, inner - 34))
+        if self.fraction is None:
+            bar = marquee_parts(tick, cells)
+        else:
+            bar = bar_parts(self.fraction, cells)
+        percent = ""
+        if self.fraction is not None and self.percent:
+            percent = f" {int(self.fraction * 100):3d}%"
+        rows.append([*bar, (percent, "bold"), ("  " + self.detail if self.detail else "", "dim")])
+        if self.show_log:
+            rows.append([(g("arrow") + " ", "dim"), (self.log, "dim")])
+        if self.tips:
+            turn = int((time.monotonic() - self._started) // self.TIP_SECONDS)
+            tip = self.tips[turn % len(self.tips)]
+            rows.append([("Tip: ", "yellow"), (tip, "dim")])
+        return window("Working on it", rows)
 
     def _spin(self) -> None:
-        for frame in itertools.cycle(g("frames")):
-            room = max(0, width() - len(self.label) - 8)
-            detail = paint(self.detail[:room], "dim") if self.detail else ""
-            sys.stdout.write(f"\r\x1b[2K  {paint(frame, 'cyan')} {self.label}  {detail}")
+        tick = 0
+        while True:
+            lines = self._frame(tick)
+            up = f"\x1b[{self._height}A" if self._height else ""
+            self._height = len(lines)
+            sys.stdout.write(up + "".join(f"\r\x1b[2K  {line}\n" for line in lines))
             sys.stdout.flush()
+            tick += 1
             if self._stop.wait(0.08):
                 return
 
     def __enter__(self) -> Task:
         self._started = time.monotonic()
+        self._mark = (self._started, 0)
         if fancy():
-            sys.stdout.write("\x1b[?25l")  # hide the cursor while spinning
+            sys.stdout.write("\x1b[?25l")  # hide the cursor while the window lives
             self._thread = threading.Thread(target=self._spin, daemon=True)
             self._thread.start()
         else:
@@ -237,12 +416,13 @@ class Task:
         self._stop.set()
         if self._thread:
             self._thread.join()
-            sys.stdout.write("\r\x1b[2K\x1b[?25h")
+            sys.stdout.write(f"\x1b[{self._height}A\r\x1b[J\x1b[?25h")  # fold the window away
         if exc_type is not None or self.failed:
             print(f"  {paint(g('bad'), 'red')} {self.label}")
         else:
             took = paint(f"{time.monotonic() - self._started:.1f}s", "dim")
-            print(f"  {paint(g('ok'), 'green')} {self.label}  {took}")
+            result = paint(self.result, "dim") + "  " if self.result else ""
+            print(f"  {paint(g('ok'), 'green')} {self.label}  {result}{took}")
         return False
 
 
@@ -252,12 +432,13 @@ def run_quiet(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    tips: Sequence[str] = (),
 ) -> int:
-    """Run a command behind a spinner showing its last line; on failure print what it said."""
+    """Run a command in a live window showing its last line; on failure print what it said."""
     merged = {**os.environ, **(env or {})}
     tail: deque[str] = deque(maxlen=12)
     code = 1
-    with Task(label) as task:
+    with Task(label, tips=tips, log=True) as task:
         try:
             proc = subprocess.Popen(  # noqa: S603
                 list(command), cwd=cwd, env=merged, text=True, encoding="utf-8", errors="replace",
@@ -271,7 +452,7 @@ def run_quiet(
                 for line in proc.stdout or ():
                     if line.strip():
                         tail.append(line.rstrip())
-                        task.detail = line.strip()
+                        task.log = line.strip()
                 code = proc.wait()
             finally:
                 if proc.poll() is None:
@@ -407,24 +588,46 @@ def code_signin(*, interactive: bool) -> str:
         why = reply.get("error_description") or reply.get("error") or "no reason given"
         raise SetupError(f"GitHub did not give a code: {why}.")
     uri = reply.get("verification_uri") or f"{WEB}/login/device"
-    say("L'Usine's files are private, so GitHub must know who you are. It takes a minute.")
     print()
     box([f"Your code:   {reply['user_code']}"], color="yellow", indent=6)
     print()
+    copied = copy_to_clipboard(reply["user_code"]) if interactive else False
+    opens = "GitHub opens in your browser" + (", the code is copied: paste it." if copied else ".")
+    if fancy():
+        rows: list[Parts] = [
+            [("1  ", "bold cyan"), (opens if interactive else "Open " + uri, "")],
+            [("2  ", "bold cyan"), ("Type the code above on that page.", "")],
+            [
+                ("3  ", "bold cyan"),
+                ('Click "Continue", then "Authorize". Nothing to copy back.', ""),
+            ],
+            [],
+            [(f"Not opening? Go to {uri}", "dim")],
+        ]
+        show(window("Your turn", rows, color="yellow"))
+        print()
+    else:
+        say(opens if interactive else f"Open {uri}")
+        say(f"Not opening? Go to {uri} and type the code.")
+        say('Then click "Continue" and "Authorize". Nothing to copy back.')
+        print()
     if interactive:
-        copied = copy_to_clipboard(reply["user_code"])
-        say("GitHub opens in your browser" + (", the code is copied: paste it." if copied else "."))
         webbrowser.open(uri)
-    say(f"Not opening? Go to {paint(uri, 'cyan')} and type the code.")
-    say('Then click "Continue" and "Authorize". Nothing to copy back.')
-    print()
     interval = int(reply.get("interval", 5))
     deadline = time.monotonic() + int(reply.get("expires_in", 900))
     failures = 0
-    with Task("Waiting for you to authorize on GitHub") as task:
+    lifetime = max(1, int(reply.get("expires_in", 900)))
+    tips = [
+        "No password reaches this script, only a token you approve.",
+        "Your sign-in is kept in ~/.lusine: next time, no code needed.",
+        "The code expires after a while: the bar shows what is left.",
+    ]
+    with Task("Waiting for you to authorize on GitHub", tips=tips) as task:
+        task.percent = False
         while time.monotonic() < deadline:
             left = int(deadline - time.monotonic())
-            task.detail = f"{left // 60}:{left % 60:02d} left"
+            task.fraction = left / lifetime
+            task.detail = f"{clock(left)} left"
             sleep(interval)
             try:
                 poll = _post_json(
@@ -444,6 +647,8 @@ def code_signin(*, interactive: bool) -> str:
             if poll.get("access_token"):
                 task.label = "Authorized on GitHub"
                 task.detail = ""
+                task.fraction = 1.0
+                task.tips = []
                 return poll["access_token"]
             error = poll.get("error", "")
             if error == "slow_down":
@@ -530,7 +735,12 @@ def download(target: Path, token: str) -> str:
     """Unpack the latest files of the repository into ``target`` (new or empty). Returns the sha."""
     archive = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
     try:
-        with Task("Downloading L'Usine") as task, archive:
+        tips = [
+            "GitHub packs the whole repository into one archive: one request.",
+            "A visitor copy is plain files, without git history: light.",
+            "Nothing from L'Usine is executed during the download.",
+        ]
+        with Task("Downloading L'Usine from GitHub", tips=tips) as task, archive:
             with _open(f"{API}/repos/{REPO}/commits/HEAD", token=token) as reply:
                 sha = parse_sha(reply.read().decode())
             with _open(f"{API}/repos/{REPO}/tarball/{sha}", token=token) as reply:
@@ -540,7 +750,7 @@ def download(target: Path, token: str) -> str:
                     archive.write(chunk)
                     done += len(chunk)
                     task.progress(done, total)
-        with Task("Unpacking the files"):
+        with Task("Unpacking the files (nothing leaves the folder)"):
             extract(Path(archive.name), target)
     except urllib.error.URLError as exc:
         raise SetupError(f"Could not download L'Usine ({exc}). Run this again.") from exc
@@ -598,8 +808,11 @@ def installer(target: Path, *args: str, token: str = "") -> None:
     if token:
         env["LUSINE_TOKEN"] = token
     command = [uv_binary(), "run", "--no-project", "--python", ">=3.11,<3.13", "python", "-m"]
-    labels = {"adopt": "Marking the copy", "update": "Updating the files"}
-    label = labels.get(args[0], "Saving your sign-in")
+    labels = {
+        "adopt": "Stamping the copy with its version",
+        "update": "Updating the files",
+    }
+    label = labels.get(args[0], "Keeping your sign-in for next time")
     if run_quiet([*command, "utils.installer", *args], label, env=env, cwd=target):
         raise SetupError("Could not finish unpacking L'Usine. Run this again.")
 
@@ -646,7 +859,13 @@ def sync_command() -> list[str]:
 
 def prepare(target: Path) -> None:
     """Install the libraries now, behind a progress line, so that the first start is instant."""
-    if run_quiet(sync_command(), "Installing the libraries", cwd=target):
+    tips = [
+        "uv downloads in parallel and caches: next time is much faster.",
+        "Libraries go into a private .venv: your own Python is untouched.",
+        "Streamlit turns a Python script into the web app you will see.",
+        "Only the first run is slow: starting L'Usine later is instant.",
+    ]
+    if run_quiet(sync_command(), "Installing the libraries", cwd=target, tips=tips):
         raise SetupError(
             "The libraries could not be installed (the lines above say why). Run this again;\n"
             "if it keeps failing, send those lines to the DSP team."
@@ -654,12 +873,30 @@ def prepare(target: Path) -> None:
 
 
 def visitor(target: Path, *, interactive: bool, dry_run: bool) -> None:
-    step(2, "Sign in to GitHub")
+    step(
+        2,
+        "Sign in to GitHub",
+        [
+            "L'Usine lives in a private DevoteamSP repository, so GitHub has to know who you are.",
+            "No password goes through this script: GitHub shows a short code, you type it on "
+            "github.com, and you are in.",
+        ],
+        tip="Already signed in from a previous run? Then this step takes a second.",
+    )
     if dry_run:
         say("(dry run) sign in, then download the latest files of " + REPO)
         return
     token = get_token(interactive=interactive)
-    step(3, "Download L'Usine")
+    step(
+        3,
+        "Download L'Usine",
+        [
+            "I ask GitHub for the newest version, download it as one compressed archive and "
+            "unpack it in your folder.",
+            "Only files are copied: nothing is executed, and the unpacking refuses any file "
+            "that tries to leave the target folder.",
+        ],
+    )
     if (target / ".lusine-snapshot.json").is_file():
         installer(target, "update", str(target), token=token)
     elif target.exists() and any(target.iterdir()):
@@ -724,7 +961,16 @@ def install_tools(missing: list[str]) -> None:
 
 
 def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
-    step(2, "Check git and the GitHub tool (gh)")
+    step(
+        2,
+        "Check your tools",
+        [
+            "A real clone needs two tools: git (keeps the history of every change) and gh "
+            "(the GitHub command line, which also handles the sign-in).",
+            "If one is missing and your system has winget or brew, I can install it for you "
+            "after your OK.",
+        ],
+    )
     missing = [name for name in ("git", "gh") if not have(name)]
     if missing and interactive and not dry_run:
         warn(f"Not found: {', '.join(missing)}")
@@ -740,7 +986,15 @@ def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
             "then run this again, or add --visitor (nothing to install)."
         )
     good("git and gh are ready")
-    step(3, "Sign in to GitHub")
+    step(
+        3,
+        "Sign in to GitHub",
+        [
+            "gh asks GitHub who you are. Your browser opens, you confirm a code, and gh "
+            "remembers you: git can then clone private repositories.",
+        ],
+        tip="Already signed in? gh tells me and this step is skipped.",
+    )
     login = ["gh", "auth", "login", "--web", "--git-protocol", "https"]
     clone = ["gh", "repo", "clone", REPO, str(target)]
     pull = ["git", "-C", str(target), "pull", "--ff-only"]
@@ -759,11 +1013,15 @@ def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
         run_quiet(["gh", "auth", "setup-git"], "Connecting git to GitHub")
     if run_quiet(["gh", "api", f"repos/{REPO}", "--jq", ".full_name"], "Checking your access"):
         raise SetupError(f"GitHub does not let you open {REPO}.\n{ACCESS_HELP}")
+    developer_download = (
+        "A git clone copies the whole repository with its history, so you can create branches, "
+        "commit and push your own changes."
+    )
     if dry_run:
-        step(4, "Download L'Usine")
+        step(4, "Download L'Usine", developer_download)
         say(f"(dry run) would propose:  {' '.join(pull if (target / '.git').is_dir() else clone)}")
         return
-    step(4, "Download L'Usine")
+    step(4, "Download L'Usine", developer_download)
     if (target / ".git").is_dir():
         why = "L'Usine is already here: this brings it up to date."
         if propose(pull, why, interactive=interactive):
@@ -788,17 +1046,113 @@ def choose_profile(asked: str | None, *, interactive: bool) -> str:
     default = "2" if previous == "developer" else "1"
     if not interactive:
         return "developer" if default == "2" else "visitor"
-    print(
-        f"\n      {paint('1', 'bold', 'cyan')}   {paint('Visitor', 'bold')}  "
-        f"{paint('(quickest)', 'green')}\n"
-        "          I just want to see it. Nothing to install but uv;\n"
-        "          you sign in to GitHub once.\n\n"
-        f"      {paint('2', 'bold', 'cyan')}   {paint('Developer', 'bold')}\n"
-        "          I need to clone and have everything. Needs git and the GitHub tool (gh);\n"
-        "          missing ones can be installed for you.\n"
-    )
-    choice = input(f"      Your choice, 1 or 2 [{default}]: ").strip() or default
+    options = [
+        (
+            "1",
+            "Visitor",
+            "(quickest)",
+            ["I just want to see it. Nothing to install but uv; you sign in to GitHub once."],
+        ),
+        (
+            "2",
+            "Developer",
+            "",
+            [
+                "I need to clone and have everything. Needs git and the GitHub "
+                "tool (gh); missing ones can be installed for you."
+            ],
+        ),
+    ]
+    print()
+    for number, name, hint, lines in options:
+        title = f"{number} {g('sep')} {name} {hint}".strip()
+        if fancy():
+            show(window(title, paragraphs(lines), color="cyan" if number == default else "dim"))
+        else:
+            say(title)
+            for line in wrap(lines[0], 70):
+                say("  " + line)
+    print()
+    prompt = f"  {paint('?', 'cyan', 'bold')} Your choice, 1 or 2 [{default}]: "
+    choice = input(prompt).strip() or default
     return "developer" if choice == "2" else "visitor"
+
+
+def desktop_dir() -> Path:
+    """The Desktop folder: ``LUSINE_DESKTOP`` (tests), else where Windows or macOS keeps it."""
+    if os.environ.get("LUSINE_DESKTOP"):
+        return Path(os.environ["LUSINE_DESKTOP"])
+    if sys.platform == "win32":
+        try:  # the real folder, also when OneDrive or the company moved it
+            import winreg
+
+            key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as handle:
+                return Path(str(winreg.QueryValueEx(handle, "Desktop")[0]))
+        except (ImportError, OSError):
+            pass
+    return Path.home() / "Desktop"
+
+
+def shortcut_name() -> str:
+    return "L'Usine.cmd" if sys.platform == "win32" else "L'Usine.command"
+
+
+def shortcut_text(target: Path, uv: str) -> str:
+    """What a double-click runs: go to the L'Usine folder, then ``uv run lusine``."""
+    if sys.platform == "win32":
+        folder, tool = str(target).replace("%", "%%"), uv.replace("%", "%%")
+        lines = [
+            "@echo off",
+            "chcp 65001 >nul",  # folders with accents in the user name
+            "title L'Usine",
+            f'cd /d "{folder}"',
+            f'"{tool}" run lusine',
+            "if errorlevel 1 pause",  # keep the window open when something went wrong
+        ]
+        return "\r\n".join(lines) + "\r\n"
+    lines = [
+        "#!/bin/bash",
+        f"cd {shlex.quote(str(target))} || exit 1",
+        f"{shlex.quote(uv)} run lusine",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def create_shortcut(target: Path) -> Path:
+    """Write the launcher on the Desktop (a .command file on macOS, a .cmd file on Windows)."""
+    folder = desktop_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    file = folder / shortcut_name()
+    file.write_text(shortcut_text(target, uv_binary()), encoding="utf-8", newline="")
+    if sys.platform != "win32":
+        file.chmod(0o755)  # a double-click only opens what is executable
+    return file
+
+
+def offer_shortcut(target: Path, *, interactive: bool, force: bool, skip: bool) -> None:
+    """Before L'Usine starts: offer a Desktop shortcut for the next time (macOS and Windows)."""
+    if skip or sys.platform not in ("darwin", "win32") or not (interactive or force):
+        return
+    if not force:
+        print()
+        explain(
+            "One more thing",
+            [
+                "Next time, you can start L'Usine with a double-click. I can put a shortcut on "
+                "your Desktop: it opens a terminal in the L'Usine folder and runs "
+                "`uv run lusine` for you.",
+            ],
+            tip="To remove it later, just delete the file: nothing else is touched.",
+        )
+        if not ask_yes("Put a shortcut on your Desktop?"):
+            return
+    try:
+        file = create_shortcut(target)
+    except (OSError, SetupError) as exc:
+        warn(f"No shortcut this time ({exc}). Start L'Usine with: cd {target}  then  uv run lusine")
+        return
+    good(f"Shortcut created: {paint(str(file), 'cyan')}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -809,6 +1163,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true", help="take every default, never ask")
     parser.add_argument("--dry-run", action="store_true", help="say what would change")
     parser.add_argument("--no-launch", action="store_true", help="stop before starting L'Usine")
+    parser.add_argument(
+        "--shortcut", action="store_true", help="add a Desktop shortcut, no question"
+    )
+    parser.add_argument(
+        "--no-shortcut", action="store_true", help="do not offer a Desktop shortcut"
+    )
     args = parser.parse_args(argv)
     interactive = not args.yes and sys.stdin.isatty()
     os.environ.pop("VIRTUAL_ENV", None)  # the one of this script, not of L'Usine
@@ -817,11 +1177,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ.setdefault("UV_SYSTEM_CERTS", "1")
     try:
         banner()
-        step(1, "Who are you?")
+        step(
+            1,
+            "Who are you?",
+            [
+                "Welcome to the factory! Before I fetch anything, tell me how you plan to use "
+                "L'Usine, so that I only install what you need.",
+            ],
+            tip="Not sure? Pick Visitor: it is quicker. You can clone later in another folder.",
+        )
         profile = choose_profile(args.profile, interactive=interactive)
-        STEPS["total"] = 5 if profile == "developer" else 4
+        names = ["Who", "Tools", "Sign in", "Download", "Start"]
+        if profile == "visitor":
+            names.remove("Tools")
+        STEPS.update(total=len(names), names=names)
         target = args.dir.expanduser().resolve() / "lusine"
-        good(f"{profile.capitalize()}: L'Usine will live in {paint(str(target), 'cyan')}")
+        good(f"{profile.capitalize()} it is.")
+        say(f"L'Usine will live in {paint(str(target), 'cyan')}")
         if not args.dry_run:
             warm_up_python()
         started = time.monotonic()
@@ -836,19 +1208,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not credentials.exists():  # without it Streamlit asks for an e-mail and waits
             credentials.parent.mkdir(parents=True, exist_ok=True)
             credentials.write_text('[general]\nemail = ""\n', encoding="utf-8")
-        step(STEPS["total"], "Start L'Usine")
+        step(
+            STEPS["total"],
+            "Start L'Usine",
+            [
+                "L'Usine is a Python app. uv reads its project file and installs the libraries "
+                "into a private .venv folder inside L'Usine: your own Python stays untouched.",
+                "The first time takes a few minutes. After that, starting is instant.",
+            ],
+        )
         prepare(target)
         print()
-        box([f"Ready in {time.monotonic() - started:.0f}s", f"Folder: {target}"], color="green")
+        took = f"{time.monotonic() - started:.0f}s"
+        later = f"cd {target}  then  uv run lusine"
+        if fancy():
+            rows: list[Parts] = [
+                [("Ready in " + took, "bold green")],
+                [],
+                [("Folder", "dim")],
+                *[[(line, "cyan")] for line in wrap(str(target), box_width() - 4)],
+                [("Next time", "dim")],
+                *[[(line, "")] for line in wrap(later, box_width() - 4)],
+                [],
+                [("Hard hat on. Welcome to the factory.", "bold")],
+            ]
+            show(window("All done", rows, color="green"))
+        else:
+            box([f"Ready in {took}", f"Folder: {target}"], color="green")
+        offer_shortcut(target, interactive=interactive, force=args.shortcut, skip=args.no_shortcut)
         if args.no_launch:
-            say(f"Start it later with:  cd {target}  then  uv run lusine")
+            say(f"Start it later with:  {later}")
             return 0
         print()
-        say("Your browser opens in a moment. Keep this window open; close it to stop.")
+        explain(
+            "Launching",
+            [
+                "Streamlit starts a small web server on your own machine and opens your browser. "
+                "Keep this window open: closing it (or Ctrl-C) stops L'Usine.",
+            ],
+            color="green",
+        )
         code = run([uv_binary(), "run", "lusine"], cwd=target)
         return 0 if code == 130 else code
     except SetupError as exc:
-        print(f"\n!! {exc}", file=sys.stderr)
+        print(file=sys.stderr)
+        if fancy():
+            rows = [
+                [(line, "")]
+                for text in str(exc).split("\n")
+                for line in wrap(text, box_width() - 4)
+            ]
+            show(window("A wrench in the gears", rows, color="red"), file=sys.stderr)
+        else:
+            print(f"!! {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

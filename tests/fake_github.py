@@ -8,6 +8,7 @@ import io
 import json
 import tarfile
 import threading
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,8 @@ class FakeGitHub:
     can_write: bool = True
     #: Extra tar members as ``(name, content)``, to test hostile downloads.
     extra_members: list[tuple[str, bytes]] = field(default_factory=list)
+    #: Seconds to wait between two 256 KB chunks of a download (to watch a progress bar).
+    throttle: float = 0.0
     seen: list[tuple[str, str, str]] = field(default_factory=list)
     url: str = ""
 
@@ -80,7 +83,17 @@ def _handler(state: FakeGitHub) -> type[BaseHTTPRequestHandler]:
             parts = path.strip("/").split("/")
             if parts[0] == "codeload":
                 repo = "/".join(parts[1:3])
-                return self._send(200, state.tarball(repo), "application/gzip")
+                body = state.tarball(repo)
+                if not state.throttle:
+                    return self._send(200, body, "application/gzip")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                for start in range(0, len(body), 256 * 1024):
+                    self.wfile.write(body[start : start + 256 * 1024])
+                    time.sleep(state.throttle)
+                return None
             if not self._authorized():
                 return self._json(401, {"message": "Bad credentials"})
             if path == "/user":
