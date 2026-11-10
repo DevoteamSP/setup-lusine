@@ -423,3 +423,27 @@ def test_the_mac_launcher_really_starts_uv_in_the_lusine_folder(
     done = subprocess.run([str(launcher)], capture_output=True, text=True, check=False)
     assert done.returncode == 0
     assert done.stdout.strip() == f"uv run lusine in {target.resolve()}"
+
+
+def test_the_browser_opens_only_after_the_person_pressed_enter(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": events.append("enter") or "")
+    monkeypatch.setattr(setup.webbrowser, "open", lambda url: events.append("browser"))
+    monkeypatch.setattr(setup, "copy_to_clipboard", lambda text: events.append("copy") or True)
+    assert setup.code_signin(interactive=True) == fake.token
+    assert events == ["copy", "enter", "copy", "browser"]  # copied, asked, copied again, opened
+    out = capsys.readouterr().out
+    assert "ABCD-1234" in out and "Press Enter" in out and "already copied" in out
+
+
+def test_without_a_keyboard_nothing_waits_and_no_browser_opens(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*_a, **_k):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr("builtins.input", refuse)
+    monkeypatch.setattr(setup.webbrowser, "open", refuse)
+    assert setup.code_signin(interactive=False) == fake.token

@@ -588,30 +588,45 @@ def code_signin(*, interactive: bool) -> str:
         why = reply.get("error_description") or reply.get("error") or "no reason given"
         raise SetupError(f"GitHub did not give a code: {why}.")
     uri = reply.get("verification_uri") or f"{WEB}/login/device"
+    code = reply["user_code"]
+    copied = copy_to_clipboard(code) if interactive else False
+    paste = "Cmd+V" if sys.platform == "darwin" else "Ctrl+V"
     print()
-    box([f"Your code:   {reply['user_code']}"], color="yellow", indent=6)
+    box([f"Your code:   {code}"], color="yellow", indent=6)
     print()
-    copied = copy_to_clipboard(reply["user_code"]) if interactive else False
-    opens = "GitHub opens in your browser" + (", the code is copied: paste it." if copied else ".")
+    if interactive:
+        first = "Press Enter below: GitHub opens in your browser."
+        second = (
+            f"Paste the code ({paste}): it is already copied."
+            if copied
+            else f"Type the code {code} on that page."
+        )
+    else:
+        first = f"Open {uri}"
+        second = f"Type the code {code} on that page."
+    third = 'Click "Continue", then "Authorize". Nothing to copy back.'
+    fourth = "Come back to this window: it carries on by itself."
     if fancy():
         rows: list[Parts] = [
-            [("1  ", "bold cyan"), (opens if interactive else "Open " + uri, "")],
-            [("2  ", "bold cyan"), ("Type the code above on that page.", "")],
-            [
-                ("3  ", "bold cyan"),
-                ('Click "Continue", then "Authorize". Nothing to copy back.', ""),
-            ],
+            [("1  ", "bold cyan"), (first, "bold" if interactive else "")],
+            [("2  ", "bold cyan"), (second, "")],
+            [("3  ", "bold cyan"), (third, "")],
+            [("4  ", "bold cyan"), (fourth, "")],
             [],
-            [(f"Not opening? Go to {uri}", "dim")],
+            [(f"The page is {uri} if your browser does not open.", "dim")],
         ]
         show(window("Your turn", rows, color="yellow"))
         print()
     else:
-        say(opens if interactive else f"Open {uri}")
-        say(f"Not opening? Go to {uri} and type the code.")
-        say('Then click "Continue" and "Authorize". Nothing to copy back.')
+        for line in (first, second, third, fourth):
+            say(line)
+        say(f"The page is {uri} if your browser does not open.")
         print()
     if interactive:
+        # Wait for a key first: once the browser opens, this window is hidden behind it.
+        input(f"  {paint('>', 'yellow', 'bold')} Press Enter to open GitHub (Control-C to stop). ")
+        if copied:
+            copy_to_clipboard(code)  # in case something else was copied in the meantime
         webbrowser.open(uri)
     interval = int(reply.get("interval", 5))
     deadline = time.monotonic() + int(reply.get("expires_in", 900))
