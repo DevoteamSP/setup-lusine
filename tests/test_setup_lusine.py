@@ -260,3 +260,74 @@ def test_a_failed_library_install_stops_the_setup(
     monkeypatch.setattr(setup, "uv_binary", lambda: "uv")
     with pytest.raises(setup.SetupError, match="libraries could not be installed"):
         setup.prepare(tmp_path)
+
+
+@pytest.fixture
+def fancy_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup, "fancy", lambda: True)
+    monkeypatch.setattr(setup, "width", lambda: 80)
+
+
+def _visible(text: str) -> str:
+    import re
+
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
+def test_the_bar_fills_in_eighths_and_has_a_fixed_width(fancy_terminal: None) -> None:
+    for fraction in (0, 0.01, 0.5, 0.999, 1):
+        parts = setup.bar_parts(fraction, 20)
+        assert sum(len(text) for text, _style in parts) == 20
+    assert setup.bar_parts(0, 10)[0][0] == ""
+    assert setup.bar_parts(1, 10)[0] == ("█" * 10, "green")
+    assert setup.bar_parts(0.5, 10)[0] == ("█" * 5, "cyan")
+
+
+def test_the_plain_bar_uses_hashes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup, "fancy", lambda: False)
+    assert setup.bar_parts(0.5, 10) == [("#####-----", "")]
+
+
+def test_the_sweeping_light_stays_inside_the_bar(fancy_terminal: None) -> None:
+    for tick in range(200):
+        parts = setup.marquee_parts(tick, 30)
+        assert sum(len(text) for text, _style in parts) == 30
+
+
+def test_every_window_row_has_the_same_width(fancy_terminal: None) -> None:
+    lines = setup.window("Title", [[("short", "")], [("x" * 500, "bold")], []])
+    assert {len(_visible(line)) for line in lines} == {setup.box_width()}
+    assert "…" in _visible(lines[2])  # the long row is cut with an ellipsis
+
+
+def test_the_road_map_shows_done_current_and_next(fancy_terminal: None) -> None:
+    setup.STEPS.update(total=3, names=["Who", "Sign in", "Start"])
+    line = _visible(setup.stepper(2))
+    assert line.index("✔") < line.index("●") < line.index("○")
+
+
+def test_explain_in_plain_text_keeps_the_words(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.setattr(setup, "fancy", lambda: False)
+    setup.explain("Step 2/4 - Sign in", ["Why it matters."], tip="A tip.")
+    out = capsys.readouterr().out
+    assert "Step 2/4 - Sign in" in out and "Why it matters." in out and "Tip: A tip." in out
+
+
+def test_the_task_window_folds_into_one_line(
+    fancy_terminal: None, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setattr(setup.Task, "_spin", lambda self: self._stop.wait())
+    with setup.Task("Doing it") as task:
+        task.result = "3.0 MB"
+    out = capsys.readouterr().out
+    assert "✔" in out and "Doing it" in out and "3.0 MB" in out
+
+
+def test_progress_tells_speed_and_time_left(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = setup.Task("Downloading")
+    clock_values = iter([10.0, 11.0])
+    monkeypatch.setattr(setup.time, "monotonic", lambda: next(clock_values))
+    task._mark = (9.0, 0)
+    task.progress(2_000_000, 10_000_000)
+    assert task.fraction == pytest.approx(0.2)
+    assert "2.0 of 10.0 MB" in task.detail and "MB/s" in task.detail
