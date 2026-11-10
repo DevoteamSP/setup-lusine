@@ -46,6 +46,29 @@ FILES = {
 }
 
 
+def preview() -> None:
+    """The setup in your own terminal against the fake GitHub, slowed down to watch the screen."""
+    files = {**FILES, "pad.bin": os.urandom(12 * 1024 * 1024)}
+    state = FakeGitHub(repos={REPO: files}, throttle=0.06, pending_polls=3, device_interval=2)
+    server, url = serve(state)
+    work = Path(tempfile.mkdtemp(prefix="sl-preview-"))
+    env = {
+        **os.environ,
+        "LUSINE_REPO_SLUG": REPO,
+        "LUSINE_GITHUB_API": url,
+        "LUSINE_GITHUB_WEB": url,
+        "LUSINE_GITHUB_CLIENT_ID": "preview",
+        "LUSINE_HOME": str(work / "home"),
+        "BROWSER": "true",  # do not open a real browser
+    }
+    for name in ("LUSINE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        env.pop(name, None)
+    command = ["uv", "run", str(ROOT / "setup_lusine.py"), "--no-launch"]
+    command += ["--dir", str(work / "files"), *sys.argv[2:]]
+    subprocess.run(command, env=env, check=False)
+    server.shutdown()
+
+
 def visitor() -> None:
     state = FakeGitHub(repos={REPO: FILES})
     server, url = serve(state)
@@ -99,5 +122,7 @@ def developer(target: Path) -> None:
 if __name__ == "__main__":
     if sys.argv[1] == "visitor":
         visitor()
+    elif sys.argv[1] == "preview":
+        preview()
     else:
         developer(Path(sys.argv[2]))
