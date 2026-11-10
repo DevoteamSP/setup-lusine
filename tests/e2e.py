@@ -103,7 +103,8 @@ def visitor() -> None:
         name = "L'Usine.cmd" if sys.platform == "win32" else "L'Usine.command"
         launcher = work / "Desktop" / name
         text = launcher.read_text(encoding="utf-8") if launcher.is_file() else ""
-        if str(target) not in text or "run lusine" not in text:
+        # the script writes the resolved path (a runner's temp folder has a short 8.3 name too)
+        if str(target.resolve()) not in text or "run lusine" not in text:
             problems.append("the Desktop shortcut is missing or does not start L'Usine")
     if not (home / "install-mode").read_text().startswith("visitor"):
         problems.append("the profile was not remembered")
