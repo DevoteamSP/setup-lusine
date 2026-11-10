@@ -294,9 +294,46 @@ def copy_to_clipboard(text: str) -> bool:
 # --- GitHub ----------------------------------------------------------------------------------
 
 
+WINDOWS_ROOTS: dict[str, Path | None] = {}  # filled once: the file with Microsoft's roots
+
+
+def fetch_windows_roots() -> Path | None:
+    """Ask Windows Update for Microsoft's list of trusted root certificates, as a .pem file.
+
+    A fresh Windows machine may lack a root that GitHub's chain needs (Sectigo E46, for one):
+    Windows adds roots on demand for the browser, but Python only sees those already installed.
+    The file is read by this script alone: no store is changed, no admin rights, no prompt.
+    """
+    if "file" in WINDOWS_ROOTS:
+        return WINDOWS_ROOTS["file"]
+    WINDOWS_ROOTS["file"] = None
+    folder = Path(tempfile.mkdtemp(prefix="lusine-roots-"))
+    sst, pem = folder / "roots.sst", folder / "roots.pem"
+    export = (
+        "$all = New-Object Security.Cryptography.X509Certificates.X509Certificate2Collection; "
+        f"$all.Import('{sst}'); "
+        "$text = foreach ($c in $all) { '-----BEGIN CERTIFICATE-----'; "
+        "[Convert]::ToBase64String($c.RawData, 'InsertLineBreaks'); '-----END CERTIFICATE-----' }; "
+        f"Set-Content -Path '{pem}' -Value $text -Encoding ascii"
+    )
+    steps = (
+        ["certutil", "-generateSSTFromWU", str(sst)],
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", export],
+    )
+    try:
+        for command in steps:
+            if subprocess.run(command, timeout=120, check=False, **SILENT).returncode:
+                return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if pem.is_file() and pem.stat().st_size:
+        WINDOWS_ROOTS["file"] = pem
+    return WINDOWS_ROOTS["file"]
+
+
 @functools.cache
-def ssl_context() -> ssl.SSLContext:
-    """Python's default certificates, plus the ones Windows trusts.
+def ssl_context(extra_roots: Path | None = None) -> ssl.SSLContext:
+    """Python's default certificates, plus the ones Windows trusts (and, if given, a .pem file).
 
     The Python that uv brings ignores the Windows certificate store. Behind a company proxy that
     re-signs HTTPS with its own root certificate, GitHub then fails with CERTIFICATE_VERIFY_FAILED
@@ -316,6 +353,8 @@ def ssl_context() -> ssl.SSLContext:
                         context.load_verify_locations(cadata=der)
                     except ssl.SSLError:
                         pass  # an unusable certificate in the store: ignore it
+    if extra_roots:
+        context.load_verify_locations(cafile=str(extra_roots))
     return context
 
 
@@ -325,7 +364,14 @@ def _open(url: str, *, data: dict[str, str] | None = None, token: str | None = N
         headers["Authorization"] = f"Bearer {token}"
     body = urllib.parse.urlencode(data).encode() if data is not None else None
     request = urllib.request.Request(url, body, headers)
-    return urllib.request.urlopen(request, timeout=60, context=ssl_context())
+    try:
+        return urllib.request.urlopen(request, timeout=60, context=ssl_context())
+    except urllib.error.URLError as exc:
+        untrusted = isinstance(exc.reason, ssl.SSLCertVerificationError)
+        roots = fetch_windows_roots() if untrusted and sys.platform == "win32" else None
+        if roots is None:
+            raise
+    return urllib.request.urlopen(request, timeout=60, context=ssl_context(roots))
 
 
 NETWORK_HELP = (
