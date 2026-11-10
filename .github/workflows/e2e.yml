@@ -1,0 +1,45 @@
+name: Complete setup
+
+# A whole setup, for both profiles, on Linux and Windows.
+#  - visitor:   against a fake GitHub that serves a stand-in for L'Usine (tests/e2e.py).
+#  - developer: with the real git and gh of the runner, cloning this public repository in place
+#    of the private L'Usine (LUSINE_REPO_SLUG), signed in with the workflow token.
+# The browser sign-in itself is covered by the unit tests (fake GitHub device flow).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Profile 1, visitor
+        run: uv run tests/e2e.py visitor
+
+      - name: Profile 2, developer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LUSINE_REPO_SLUG: ${{ github.repository }}
+          LUSINE_HOME: ${{ runner.temp }}/lusine-home
+        run: |
+          uv run setup_lusine.py --developer --yes --no-launch --dir "$RUNNER_TEMP/dev"
+          uv run tests/e2e.py developer "$RUNNER_TEMP/dev/lusine"
