@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import shlex
 import sys
 import tarfile
@@ -348,7 +349,8 @@ def test_the_mac_shortcut_goes_to_the_folder_then_runs_lusine(
     assert lines[0] == "#!/bin/bash"
     assert lines[1] == f"cd {shlex.quote(str(target))} || exit 1"
     assert lines[2] == "/Users/me/.local/bin/uv run lusine"
-    assert file.stat().st_mode & 0o111  # a double-click needs it executable
+    if os.name != "nt":  # Windows files have no executable bit
+        assert file.stat().st_mode & 0o111  # a double-click needs it executable
 
 
 def test_the_windows_shortcut_is_a_cmd_file_with_crlf(
