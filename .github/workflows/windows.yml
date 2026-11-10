@@ -1,0 +1,47 @@
+name: Windows
+
+# The setup script on a Windows runner, with the Python that `uv run` brings (as a new machine has
+# it): its tests, then both profiles with --dry-run. The real download needs a GitHub sign-in to a
+# private organization, so it is not run here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [bash, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Tests of the script
+        run: uv run --group dev pytest -q
+
+      - name: Visitor, dry run
+        run: uv run setup_lusine.py --visitor --yes --dry-run --dir "$env:RUNNER_TEMP/sl"
+        if: matrix.shell == 'pwsh'
+
+      - name: Developer, dry run
+        run: uv run setup_lusine.py --developer --yes --dry-run --dir "$env:RUNNER_TEMP/sl"
+        if: matrix.shell == 'pwsh'
+
+      - name: Visitor, dry run
+        run: uv run setup_lusine.py --visitor --yes --dry-run --dir "$RUNNER_TEMP/sl"
+        if: matrix.shell == 'bash'
+
+      - name: Developer, dry run
+        run: uv run setup_lusine.py --developer --yes --dry-run --dir "$RUNNER_TEMP/sl"
+        if: matrix.shell == 'bash'
