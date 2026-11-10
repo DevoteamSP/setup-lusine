@@ -612,7 +612,7 @@ def warm_up_python() -> None:
             uv = uv_binary()
             spec = ">=3.11,<3.13"
             if subprocess.run([uv, "python", "find", spec], **SILENT).returncode:
-                subprocess.run([uv, "python", "install", "3.12"], **SILENT)
+                subprocess.run([uv, "python", "install", default_python()], **SILENT)
         except (SetupError, OSError):
             pass
 
@@ -621,6 +621,14 @@ def warm_up_python() -> None:
 
 def windows_on_arm() -> bool:
     return sys.platform == "win32" and platform.machine().upper() in ("ARM64", "AARCH64")
+
+
+def default_python() -> str:
+    """The Python L'Usine gets by default: 3.11, the lowest one the project accepts.
+
+    On Windows for ARM it is the x64 build (see ``sync_command``).
+    """
+    return "cpython-3.11-windows-x86_64-none" if windows_on_arm() else "3.11"
 
 
 def sync_command() -> list[str]:
@@ -632,7 +640,7 @@ def sync_command() -> list[str]:
     """
     command = [uv_binary(), "sync"]
     if windows_on_arm():
-        command += ["--python", "cpython-3.12-windows-x86_64-none"]
+        command += ["--python", default_python()]
     return command
 
 

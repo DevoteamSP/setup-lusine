@@ -250,7 +250,7 @@ def test_only_windows_on_arm_syncs_with_the_x64_python(
     assert command[:2] == ["uv", "sync"]
     assert ("--python" in command) is x64
     if x64:
-        assert command[-1] == "cpython-3.12-windows-x86_64-none"
+        assert command[-1] == "cpython-3.11-windows-x86_64-none"
 
 
 def test_a_failed_library_install_stops_the_setup(
