@@ -71,6 +71,17 @@ def test_download_unpacks_the_files_without_their_top_folder(
     assert (target / "doc" / "guide.md").is_file()
 
 
+def test_download_of_a_branch_asks_for_that_branch(fake: FakeGitHub, tmp_path: Path) -> None:
+    fake.branches = ("feat/x",)
+    assert setup.download(tmp_path / "lusine", fake.token, "feat/x") == fake.sha
+    assert any(call[1].endswith("/commits/feat/x") for call in fake.seen)
+
+
+def test_download_of_an_unknown_branch_says_so(fake: FakeGitHub, tmp_path: Path) -> None:
+    with pytest.raises(setup.SetupError, match="branch nope does not exist"):
+        setup.download(tmp_path / "lusine", fake.token, "nope")
+
+
 def _tar(tmp_path: Path, members: list[tuple[str, bytes]]) -> Path:
     path = tmp_path / "evil.tar.gz"
     with tarfile.open(path, "w:gz") as tar:

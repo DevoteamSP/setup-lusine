@@ -23,6 +23,8 @@ class FakeGitHub:
     #: ``owner/repo`` -> files of the default branch.
     repos: dict[str, dict[str, bytes]] = field(default_factory=dict)
     sha: str = "a" * 40
+    #: Branches other than the default one (they serve the same files and sha).
+    branches: tuple[str, ...] = ()
     #: How many "not yet" answers the device flow gives before approving.
     pending_polls: int = 1
     #: Seconds GitHub asks to wait between two questions (the shell installer really sleeps).
@@ -103,7 +105,7 @@ def _handler(state: FakeGitHub) -> type[BaseHTTPRequestHandler]:
             repo = "/".join(parts[1:3])
             if len(parts) == 3:
                 return self._json(200, {"full_name": repo, "permissions": {"push": state.can_push}})
-            if parts[3:] == ["commits", "HEAD"]:
+            if parts[3] == "commits" and parts[4:] and "/".join(parts[4:]) in ("HEAD", *state.branches):
                 if "json" in self.headers.get("Accept", ""):  # what the real API sends back
                     return self._json(200, {"sha": state.sha, "commit": {"message": "{x}"}})
                 return self._send(200, state.sha.encode(), "text/plain")
