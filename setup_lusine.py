@@ -746,8 +746,10 @@ def parse_sha(body: str) -> str:
     return body
 
 
-def download(target: Path, token: str) -> str:
-    """Unpack the latest files of the repository into ``target`` (new or empty). Returns the sha."""
+def download(target: Path, token: str, ref: str = "HEAD") -> str:
+    """Unpack the latest files of ``ref`` (default branch unless told) into ``target``
+    (new or empty). Returns the sha."""
+    ref = urllib.parse.quote(ref, safe="/")
     archive = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
     try:
         tips = [
@@ -756,7 +758,7 @@ def download(target: Path, token: str) -> str:
             "Nothing from L'Usine is executed during the download.",
         ]
         with Task("Downloading L'Usine from GitHub", tips=tips) as task, archive:
-            with _open(f"{API}/repos/{REPO}/commits/HEAD", token=token) as reply:
+            with _open(f"{API}/repos/{REPO}/commits/{ref}", token=token) as reply:
                 sha = parse_sha(reply.read().decode())
             with _open(f"{API}/repos/{REPO}/tarball/{sha}", token=token) as reply:
                 total = int(reply.headers.get("Content-Length") or 0) or None
@@ -767,6 +769,10 @@ def download(target: Path, token: str) -> str:
                     task.progress(done, total)
         with Task("Unpacking the files (nothing leaves the folder)"):
             extract(Path(archive.name), target)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 422) and ref != "HEAD":
+            raise SetupError(f"The branch {urllib.parse.unquote(ref)} does not exist in {REPO}.") from exc
+        raise SetupError(f"Could not download L'Usine ({exc}). Run this again.") from exc
     except urllib.error.URLError as exc:
         raise SetupError(f"Could not download L'Usine ({exc}). Run this again.") from exc
     finally:
@@ -887,7 +893,7 @@ def prepare(target: Path) -> None:
         )
 
 
-def visitor(target: Path, *, interactive: bool, dry_run: bool) -> None:
+def visitor(target: Path, *, interactive: bool, dry_run: bool, branch: str | None = None) -> None:
     step(
         2,
         "Sign in to GitHub",
@@ -899,7 +905,7 @@ def visitor(target: Path, *, interactive: bool, dry_run: bool) -> None:
         tip="Already signed in from a previous run? Then this step takes a second.",
     )
     if dry_run:
-        say("(dry run) sign in, then download the latest files of " + REPO)
+        say(f"(dry run) sign in, then download the latest files of {REPO}" + (f" ({branch})" if branch else ""))
         return
     token = get_token(interactive=interactive)
     step(
@@ -913,11 +919,16 @@ def visitor(target: Path, *, interactive: bool, dry_run: bool) -> None:
         ],
     )
     if (target / ".lusine-snapshot.json").is_file():
+        if branch:
+            raise SetupError(
+                f"{target} is already a copy of L'Usine: I cannot switch it to {branch}.\n"
+                "Use another folder with --dir, or delete this one first."
+            )
         installer(target, "update", str(target), token=token)
     elif target.exists() and any(target.iterdir()):
         raise SetupError(f"The folder {target} exists and was not made by L'Usine. Use --dir.")
     else:
-        sha = download(target, token)
+        sha = download(target, token, branch or "HEAD")
         installer(target, "adopt", str(target), REPO, sha, token=token)
     installer(target, "save-token", token=token)
 
@@ -975,7 +986,7 @@ def install_tools(missing: list[str]) -> None:
         run_quiet([manager, *args], f"Installing {name}")
 
 
-def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
+def developer(target: Path, *, interactive: bool, dry_run: bool, branch: str | None = None) -> None:
     step(
         2,
         "Check your tools",
@@ -995,7 +1006,7 @@ def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
         hint = {"darwin": "brew install git gh", "win32": "winget install Git.Git GitHub.cli"}
         how = hint.get(sys.platform, "your package manager")
         if interactive and not dry_run and ask_yes("Continue as a visitor instead (no gh needed)?"):
-            return visitor(target, interactive=interactive, dry_run=dry_run)
+            return visitor(target, interactive=interactive, dry_run=dry_run, branch=branch)
         raise SetupError(
             f"Missing: {', '.join(missing)}. Install with:  {how}\n"
             "then run this again, or add --visitor (nothing to install)."
@@ -1012,6 +1023,8 @@ def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
     )
     login = ["gh", "auth", "login", "--web", "--git-protocol", "https"]
     clone = ["gh", "repo", "clone", REPO, str(target)]
+    if branch:
+        clone += ["--", "--branch", branch]
     pull = ["git", "-C", str(target), "pull", "--ff-only"]
     if subprocess.run(["gh", "auth", "status"], **SILENT).returncode:
         if dry_run:
@@ -1039,6 +1052,11 @@ def developer(target: Path, *, interactive: bool, dry_run: bool) -> None:
     step(4, "Download L'Usine", developer_download)
     if (target / ".git").is_dir():
         why = "L'Usine is already here: this brings it up to date."
+        if branch:
+            fetch = ["git", "-C", str(target), "fetch", "origin", branch]
+            switch = ["git", "-C", str(target), "checkout", branch]
+            if run_quiet(fetch, f"Fetching {branch}") or run_quiet(switch, f"Switching to {branch}"):
+                raise SetupError(f"Could not switch to the branch {branch}.")
         if propose(pull, why, interactive=interactive):
             run_quiet(pull, "Updating L'Usine")
     elif target.exists() and any(target.iterdir()):
@@ -1184,6 +1202,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--no-shortcut", action="store_true", help="do not offer a Desktop shortcut"
     )
+    parser.add_argument(
+        "--branch", help="download this branch of the L'Usine repository (to test a development)"
+    )
     args = parser.parse_args(argv)
     interactive = not args.yes and sys.stdin.isatty()
     os.environ.pop("VIRTUAL_ENV", None)  # the one of this script, not of L'Usine
@@ -1209,11 +1230,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         target = args.dir.expanduser().resolve() / "lusine"
         good(f"{profile.capitalize()} it is.")
         say(f"L'Usine will live in {paint(str(target), 'cyan')}")
+        if args.branch:
+            warn(f"Development copy: branch {args.branch} instead of the default one.")
         if not args.dry_run:
             warm_up_python()
         started = time.monotonic()
         (visitor if profile == "visitor" else developer)(
-            target, interactive=interactive, dry_run=args.dry_run
+            target, interactive=interactive, dry_run=args.dry_run, branch=args.branch
         )
         if args.dry_run:
             return 0
