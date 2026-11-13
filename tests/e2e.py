@@ -102,6 +102,8 @@ def visitor() -> None:
     if sys.platform in ("darwin", "win32"):  # the Desktop shortcut: where it goes, what it runs
         name = "Lusine.cmd" if sys.platform == "win32" else "Lusine.command"
         launcher = work / "Desktop" / name
+        if sys.platform == "win32" and (work / "Desktop" / "Lusine.lnk").is_file():
+            launcher = home / name  # the .lnk with the logo points at the launcher kept here
         text = launcher.read_text(encoding="utf-8") if launcher.is_file() else ""
         # the script writes the resolved path (a runner's temp folder has a short 8.3 name too)
         if str(target.resolve()) not in text or "run lusine" not in text:
