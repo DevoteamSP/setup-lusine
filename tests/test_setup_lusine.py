@@ -370,12 +370,74 @@ def test_the_windows_shortcut_is_a_cmd_file_with_crlf(
     monkeypatch.setattr(setup.sys, "platform", "win32")
     monkeypatch.setattr(setup, "uv_binary", lambda: r"C:\Users\me\.local\bin\uv.exe")
     monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path))
-    file = setup.create_shortcut(Path(r"C:\Users\me\dev\100%\lusine"))
-    assert file.name == "Lusine.cmd"
+    monkeypatch.setattr(setup, "HOME_DIR", tmp_path / "home")
+    file = setup.create_shortcut(Path(r"C:\Users\me\dev\100%\lusine"))  # no logo here
+    assert file.name == "Lusine.cmd"  # no icon possible: the plain launcher stays on the Desktop
     raw = file.read_bytes().decode()
     assert "\r\n" in raw and "\n" not in raw.replace("\r\n", "")
     assert r'cd /d "C:\Users\me\dev\100%%\lusine"' in raw
     assert r'"C:\Users\me\.local\bin\uv.exe" run lusine' in raw
+
+
+def _fake_logos(folder: Path) -> Path:
+    import base64
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+    )
+    logos = folder / setup.LOGO_DIR
+    logos.mkdir(parents=True)
+    for size in setup.ICO_SIZES:
+        (logos / f"usine-logo-red-{size}.png").write_bytes(png)
+    return logos
+
+
+def test_the_ico_holds_every_logo_size(tmp_path: Path) -> None:
+    import struct
+
+    logos = _fake_logos(tmp_path)
+    out = tmp_path / "lusine.ico"
+    setup.build_ico(logos, out)
+    raw = out.read_bytes()
+    assert struct.unpack("<HHH", raw[:6]) == (0, 1, len(setup.ICO_SIZES))
+    size, offset = struct.unpack("<II", raw[6 + 8 : 6 + 16])
+    assert raw[offset : offset + 4] == b"\x89PNG" and size > 0
+
+
+def test_the_windows_desktop_gets_a_lnk_with_the_logo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(setup.sys, "platform", "win32")
+    monkeypatch.setattr(setup, "uv_binary", lambda: "uv.exe")
+    monkeypatch.setattr(setup, "HOME_DIR", tmp_path / "home")
+    monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path / "Desktop"))
+    target = tmp_path / "lusine"
+    _fake_logos(target)
+    made: list[tuple[Path, Path, Path]] = []
+    monkeypatch.setattr(setup, "make_windows_link", lambda *args: made.append(args))
+    file = setup.create_shortcut(target)
+    assert file.name == "Lusine.lnk"
+    link, launcher, icon = made[0]
+    assert launcher == tmp_path / "home" / "Lusine.cmd" and launcher.is_file()
+    assert icon.is_file() and icon.suffix == ".ico"
+
+
+def test_the_mac_shortcut_gets_the_logo_but_works_without_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(setup.sys, "platform", "darwin")
+    monkeypatch.setattr(setup, "uv_binary", lambda: "uv")
+    monkeypatch.setenv("LUSINE_DESKTOP", str(tmp_path / "Desktop"))
+    seen: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(setup, "set_mac_icon", lambda f, png: seen.append((f, png)))
+    file = setup.create_shortcut(tmp_path / "lusine")
+    assert seen == [(file, tmp_path / "lusine" / setup.LOGO_DIR / "usine-logo-red-512.png")]
+
+    def refused(_f: Path, _png: Path) -> None:
+        raise OSError("no")
+
+    monkeypatch.setattr(setup, "set_mac_icon", refused)
+    assert setup.create_shortcut(tmp_path / "lusine").is_file()
 
 
 def test_the_shortcut_is_offered_only_to_people_who_can_answer(

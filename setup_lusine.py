@@ -28,6 +28,7 @@ import platform
 import shlex
 import shutil
 import ssl
+import struct
 import subprocess
 import sys
 import tarfile
@@ -1152,14 +1153,90 @@ def shortcut_text(target: Path, uv: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+LOGO_DIR = Path("navigator") / "assets" / "brand" / "usine-logo"
+ICO_SIZES = (16, 32, 64, 128, 256)
+
+
+def build_ico(logo_dir: Path, out: Path) -> None:
+    """Pack the red L'Usine PNGs into one .ico (Windows reads PNG frames inside an .ico)."""
+    frames = [(n, (logo_dir / f"usine-logo-red-{n}.png").read_bytes()) for n in ICO_SIZES]
+    head = struct.pack("<HHH", 0, 1, len(frames))
+    offset = 6 + 16 * len(frames)
+    entries, data = b"", b""
+    for size, png in frames:
+        entries += struct.pack(
+            "<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(png), offset + len(data)
+        )
+        data += png
+    out.write_bytes(head + entries + data)
+
+
+def set_mac_icon(file: Path, png: Path) -> None:
+    """Show the logo on a Finder file (JXA through osascript: no extra tool to install)."""
+    if not png.is_file():
+        raise OSError(f"logo not found: {png}")
+    script = (
+        "ObjC.import('AppKit');"
+        "var a = $.NSProcessInfo.processInfo.arguments;"
+        "var img = $.NSImage.alloc.initWithContentsOfFile(a.objectAtIndex(5));"
+        "$.NSWorkspace.sharedWorkspace.setIconForFileOptions(img, a.objectAtIndex(6), 0);"
+    )
+    run_checked(["osascript", "-l", "JavaScript", "-e", script, str(png), str(file)])
+
+
+def run_checked(command: Sequence[str]) -> None:
+    done = subprocess.run(command, capture_output=True, text=True, check=False, timeout=60)
+    if done.returncode != 0:
+        raise OSError(done.stderr.strip() or f"{command[0]} failed")
+
+
+def make_windows_link(link: Path, launcher: Path, icon: Path) -> None:
+    """A real .lnk on the Desktop: only a shortcut can carry an icon, a .cmd file cannot."""
+
+    def quoted(path: Path) -> str:
+        return "'" + str(path).replace("'", "''") + "'"
+
+    script = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + quoted(link) + ");"
+        "$s.TargetPath = " + quoted(launcher) + ";"
+        "$s.WorkingDirectory = " + quoted(launcher.parent) + ";"
+        "$s.IconLocation = " + quoted(icon) + ";"
+        "$s.Save()"
+    )
+    run_checked(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
+
+
 def create_shortcut(target: Path) -> Path:
-    """Write the launcher on the Desktop (a .command file on macOS, a .cmd file on Windows)."""
+    """Write the launcher on the Desktop: Lusine.command on macOS, Lusine.lnk on Windows.
+
+    The icon is the L'Usine logo from the downloaded copy; without it (or if the system
+    refuses) the shortcut still works, it just keeps the default icon.
+    """
     folder = desktop_dir()
     folder.mkdir(parents=True, exist_ok=True)
+    text = shortcut_text(target, uv_binary())
+    logo_dir = target / LOGO_DIR
+    if sys.platform == "win32":
+        HOME_DIR.mkdir(parents=True, exist_ok=True)
+        launcher = HOME_DIR / shortcut_name()  # the .lnk on the Desktop points here
+        launcher.write_text(text, encoding="utf-8", newline="")
+        try:
+            icon = HOME_DIR / "lusine.ico"
+            build_ico(logo_dir, icon)
+            link = folder / "Lusine.lnk"
+            make_windows_link(link, launcher, icon)
+            return link
+        except (OSError, subprocess.SubprocessError):
+            file = folder / shortcut_name()  # no icon, but a launcher that works
+            file.write_text(text, encoding="utf-8", newline="")
+            return file
     file = folder / shortcut_name()
-    file.write_text(shortcut_text(target, uv_binary()), encoding="utf-8", newline="")
-    if sys.platform != "win32":
-        file.chmod(0o755)  # a double-click only opens what is executable
+    file.write_text(text, encoding="utf-8", newline="")
+    file.chmod(0o755)  # a double-click only opens what is executable
+    try:
+        set_mac_icon(file, logo_dir / "usine-logo-red-512.png")
+    except (OSError, subprocess.SubprocessError):
+        pass
     return file
 
 
