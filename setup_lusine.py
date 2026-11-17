@@ -182,9 +182,11 @@ def wrap(text: str, room: int) -> list[str]:
     return textwrap.wrap(text, max(10, room)) or [""]
 
 
-def window(title: str, rows: list[Parts], *, color: str = "cyan") -> list[str]:
+def window(
+    title: str, rows: list[Parts], *, color: str = "cyan", total: int | None = None
+) -> list[str]:
     """A rounded window as a list of lines (no margin): a title in the top edge, one row each."""
-    total = box_width()
+    total = total or box_width()
     inner = total - 4
     label = f" {title[: total - 6]} " if title else ""
     edge = paint(g("tl") + g("h"), color)
@@ -252,7 +254,7 @@ def banner() -> None:
 STEPS: dict = {"total": 0, "names": []}  # set once the profile is known
 
 
-def stepper(current: int) -> str:
+def stepper(current: int, room: int | None = None) -> str:
     """The road map in one line: what is done, where we are, what is left."""
     parts: Parts = [("  ", "")]
     names = STEPS["names"]
@@ -265,14 +267,75 @@ def stepper(current: int) -> str:
             parts += [(g("s_next") + " ", "dim"), (name, "dim")]
         if number < len(names):
             parts.append((f" {g('h') * 3} ", "dim"))
-    return fit(parts, width(), pad=False)
+    return fit(parts, room or width(), pad=False)
+
+
+def train(current: int, room: int | None = None) -> list[str]:
+    """The little train: one wagon per step, the engine pulling in front.
+
+    Done wagons are green with a tick, the current one is bright, the next ones are dimmed.
+    Too wide for the terminal (or no terminal): the one-line road map instead.
+    """
+    names = STEPS["names"]
+    engine = [  # the engine, facing right, with a puff of steam
+        [("  o O", "dim")],
+        [("\u2590\u2588\u2584\u2584\u2584\u2596", "bold cyan")],
+        [("\u2590\u2588\u2588\u2588\u2588\u2588\u2599", "bold cyan")],
+        [(" o  o o", "bold cyan")],
+    ]
+    wagons = []
+    for number, name in enumerate(names, 1):
+        if number < current:
+            mark, color, text = g("s_done"), "green", "green"
+        elif number == current:
+            mark, color, text = g("s_now"), "cyan", "bold"
+        else:
+            mark, color, text = g("s_next"), "dim", "dim"
+        label = f" {mark} {name} "
+        inner = len(label)
+        wheels = "o" + g("h") * max(0, inner - 4) + "o"
+        wagons.append(
+            [
+                [(" " * (inner + 2), "")],
+                [(g("tl") + g("h") * inner + g("tr"), color)],
+                [(g("v"), color), (label, text), (g("v"), color)],
+                [(g("bl") + g("h"), color), (wheels, color), (g("h") + g("br"), color)],
+            ]
+        )
+    coupling = [[("  ", "")], [("  ", "")], [("\u2550\u2550", "dim")], [("  ", "")]]
+    rows: list[Parts] = [[("  ", "")] for _ in range(4)]
+    for index, wagon in enumerate(wagons):
+        for row in range(4):
+            rows[row] += wagon[row] + (coupling[row] if index < len(wagons) else [])
+    for row in range(4):
+        rows[row] += coupling[row] + engine[row]
+    room = room or width()
+    length = sum(len(text) for text, _style in rows[2])
+    if not fancy() or not names or length > room:
+        return [stepper(current, room)] if names else []
+    return [fit(row, length, pad=False) for row in rows]
+
+
+def fresh_page() -> None:
+    """Start a step at the top of a clean screen; what was there goes up into the scrollback."""
+    if fancy():
+        rows = shutil.get_terminal_size((80, 24)).lines
+        sys.stdout.write("\n" * max(0, rows - 1) + "\x1b[H\x1b[J")
+        sys.stdout.flush()
 
 
 def step(number: int, title: str, why: Sequence[str] | str = "", tip: str = "") -> None:
+    """A new step: a fresh screen, the train at the top, then what is about to happen."""
     total = STEPS["total"]
+    STEPS["now"] = number
+    fresh_page()
+    if number == 1:
+        banner()
     print()
-    if STEPS["names"]:
-        print(stepper(number))
+    for line in train(number):
+        print(line)
+    if fancy():
+        print()
     head = f"Step {number}/{total}" if total else f"Step {number}"
     explain(f"{head} {g('sep')} {title}", why, tip=tip) if why else print(
         f"  {paint(head, 'bold', 'cyan')} {paint(title, 'bold')}"
@@ -284,7 +347,7 @@ def step(number: int, title: str, why: Sequence[str] | str = "", tip: str = "") 
 # and, once answered, folds into one line that keeps the answer. Without a real keyboard and
 # terminal (a pipe, CI, NO_COLOR) the questions fall back to typed answers.
 
-KEY_HINT = "\u2191\u2193 move \u00b7 Enter choose \u00b7 Ctrl-C stop"
+KEY_HINT = "\u2190\u2192 move \u00b7 Enter choose \u00b7 Ctrl-C stop"
 
 
 def can_menu() -> bool:
@@ -295,14 +358,20 @@ def can_menu() -> bool:
         return False
 
 
-def read_key() -> str:
+def read_key(timeout: float | None = None) -> str:
     """One key press: 'up', 'down', 'left', 'right', 'enter', 'tab', 'esc' or the character.
 
-    Call it inside ``keyboard()`` on macOS and Linux, so keys arrive one by one, unechoed.
+    Returns '' when nothing was pressed within ``timeout`` seconds. Call it inside
+    ``keyboard()`` on macOS and Linux, so keys arrive one by one, unechoed.
     """
     if os.name == "nt":
         import msvcrt
 
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not msvcrt.kbhit():
+            if deadline is not None and time.monotonic() >= deadline:
+                return ""
+            time.sleep(0.02)
         key = msvcrt.getwch()
         if key in ("\x00", "\xe0"):  # arrows come as two characters
             return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch(), "")
@@ -312,6 +381,8 @@ def read_key() -> str:
     import select
 
     fd = sys.stdin.fileno()
+    if not select.select([fd], [], [], timeout)[0]:
+        return ""
     data = os.read(fd, 1)
     if data == b"\x1b":  # an arrow is ESC [ A (or ESC O A); a lone ESC is the Esc key
         while select.select([fd], [], [], 0.03)[0]:
@@ -326,7 +397,8 @@ def read_key() -> str:
 
 
 class keyboard:  # noqa: N801  (used as ``with keyboard():``)
-    """Keys one by one without echo, cursor hidden; everything restored on the way out."""
+    """The whole terminal for a menu (the alternate screen, as vim or htop use), keys one by one
+    without echo, cursor hidden. Everything, the scrollback included, comes back on the way out."""
 
     def __enter__(self) -> keyboard:
         self.saved = None
@@ -337,7 +409,7 @@ class keyboard:  # noqa: N801  (used as ``with keyboard():``)
             fd = sys.stdin.fileno()
             self.saved = termios.tcgetattr(fd)
             tty.setcbreak(fd)  # Ctrl-C still stops
-        sys.stdout.write("\x1b[?25l")
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
         sys.stdout.flush()
         return self
 
@@ -346,87 +418,152 @@ class keyboard:  # noqa: N801  (used as ``with keyboard():``)
             import termios
 
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.saved)
-        sys.stdout.write("\x1b[?25h")
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
         sys.stdout.flush()
 
 
-class Screen:
-    """Lines drawn at the bottom of the terminal that can be redrawn or cleared in place."""
-
-    def __init__(self) -> None:
-        self.height = 0
-
-    def draw(self, lines: Sequence[str]) -> None:
-        self.clear()
-        sys.stdout.write("".join(line + "\n" for line in lines))
-        sys.stdout.flush()
-        self.height = len(lines)
-
-    def clear(self) -> None:
-        if self.height:
-            sys.stdout.write(f"\x1b[{self.height}F\x1b[J")  # up to the first line, erase below
-        self.height = 0
+def screen_size() -> tuple[int, int]:
+    size = shutil.get_terminal_size((80, 24))
+    return max(40, size.columns), max(12, size.lines)
 
 
-def pick(
-    count: int,
-    render,
-    *,
-    default: int = 0,
-    keys: dict[str, int] | None = None,
-    horizontal: bool = False,
-) -> int:
+def draw(lines: Sequence[str]) -> None:
+    """Paint a full page: from the top-left corner, every line erased to its end."""
+    rows = screen_size()[1]
+    body = "\x1b[K\r\n".join(lines[: rows - 1])  # one spare line: the screen never scrolls
+    sys.stdout.write(f"\x1b[H{body}\x1b[K\x1b[J")
+    sys.stdout.flush()
+
+
+def pick(count: int, render, *, default: int = 0, keys: dict[str, int] | None = None) -> int:
     """Let the person move a highlight over ``count`` options; returns the chosen index.
 
-    ``render(current)`` returns the lines to show. ``keys`` maps shortcut letters to options
-    (they move the highlight; Enter still confirms).
+    ``render(current)`` returns the page. Arrows (and Tab, h/j/k/l) move, wrapping around;
+    digits and the ``keys`` shortcut letters jump; only Enter confirms.
     """
-    current, screen = default, Screen()
-    back = ("up", "left", "k", "h") if not horizontal else ("left", "up", "h", "k")
-    ahead = ("down", "right", "tab", "j", "l")
+    current = default
     with keyboard():
-        try:
-            while True:
-                screen.draw(render(current))
-                key = read_key()
-                if key == "enter":
-                    return current
-                if key in back:
-                    current = (current - 1) % count
-                elif key in ahead:
-                    current = (current + 1) % count
-                elif key.isdigit() and 1 <= int(key) <= count:
-                    current = int(key) - 1
-                elif keys and key.lower() in keys:
-                    current = keys[key.lower()]
-        finally:
-            screen.clear()
+        shown = None
+        while True:
+            if shown != (current, screen_size()):
+                draw(render(current))
+                shown = (current, screen_size())
+            key = read_key(timeout=0.25)  # '' now and then: a resized window is redrawn
+            if key == "enter":
+                return current
+            if key in ("up", "left", "k", "h"):
+                current = (current - 1) % count
+            elif key in ("down", "right", "tab", "j", "l"):
+                current = (current + 1) % count
+            elif key.isdigit() and 1 <= int(key) <= count:
+                current = int(key) - 1
+            elif keys and key.lower() in keys:
+                current = keys[key.lower()]
 
 
 def answered(question: str, answer: str) -> None:
-    """What a menu folds into once answered."""
+    """What a menu folds into, back on the normal screen, once answered."""
     print(f"  {paint(g('ok'), 'green')} {question}  {paint(answer, 'bold', 'cyan')}")
 
 
-def button(label: str, on: bool) -> str:
-    return paint(f" {label} ", "reverse", "bold", "cyan") if on else paint(f" {label} ", "dim")
+def centered(line: str, room: int) -> str:
+    return " " * max(0, (room - len(_visible(line))) // 2) + line
 
 
-def ask_yes(question: str, *, default: bool = True) -> bool:
-    """A yes/no question: two buttons, Left/Right (or Y/N) to move, Enter to choose."""
+def cards(options: Sequence[tuple[str, str, str]], current: int, room: int) -> list[str]:
+    """The options as windows side by side (stacked when the terminal is too narrow)."""
+    count, gap = len(options), 3
+    plain = not any(text for _n, _h, text in options)  # Yes / No: short buttons
+    card = min((room - gap * (count - 1)) // count, 18 if plain else 56)
+    side_by_side = card >= (10 if plain else 24)
+    if not side_by_side:
+        card = min(room, 70)
+    boxes = []
+    for index, (name, hint, text) in enumerate(options):
+        on = index == current
+        mark = g("s_now") if on else g("s_next")
+        if plain:
+            title, rows = (
+                "",
+                [[], [(f"{mark} {name}".center(card - 4), "bold" if on else "dim")], []],
+            )
+        else:
+            title = f"{mark} {name}  {hint}".strip()
+            rows = [[], *[[(line, "" if on else "dim")] for line in wrap(text, card - 4)], []]
+        boxes.append((on, title, rows))
+    height = max(len(rows) for _on, _title, rows in boxes)
+    drawn = []
+    for on, title, rows in boxes:
+        rows = rows + [[]] * (height - len(rows))
+        lines = window(title, rows, color="cyan" if on else "dim", total=card)
+        if not on:  # a dimmed title too
+            lines[0] = paint(_visible(lines[0]), "dim")
+        drawn.append(lines)
+    if not side_by_side:
+        return [line for lines in drawn for line in lines]
+    return [(" " * gap).join(row) for row in zip(*drawn, strict=True)]
+
+
+def page(
+    question: str,
+    options: Sequence[tuple[str, str, str]],
+    current: int,
+    *,
+    title: str = "",
+    about: Sequence[str] = (),
+    tip: str = "",
+    hint: str = "",
+) -> list[str]:
+    """A full-screen page: the title bar, what the question is about, the question, the cards
+    and the keys, all centered in the terminal."""
+    cols, rows = screen_size()
+    room = cols - 4
+    top = [fit([("  L'USINE ", "bold cyan"), (g("sep") + " setup", "dim")], cols)]
+    top += train(min(len(STEPS["names"]), max(1, STEPS.get("now", 1))), cols)
+    middle: list[str] = []
+    if about:
+        text_rows: list[Parts] = []
+        for text in about:
+            if text_rows:
+                text_rows.append([])
+            style = "bold cyan" if text.startswith("$ ") else ""
+            text_rows += [[(line, style)] for line in wrap(text, room - 4)]
+        if tip:
+            text_rows += [[], *[[(line, "dim")] for line in wrap("Tip: " + tip, room - 4)]]
+        middle += [*window(title, text_rows, total=room), ""]
+    middle += [f"{paint('?', 'cyan', 'bold')} {paint(question, 'bold')}", ""]
+    deck = cards(options, current, room)
+    middle += [centered(line, room) for line in deck]
+    bottom = [centered(paint(hint or KEY_HINT, "dim"), cols)]
+    fits = rows - 1 - len(top) - len(bottom) - 2  # a blank line above and below at least
+    if about and len(middle) > fits:  # a small terminal: the cards before the explanation
+        return page(question, options, current, title=title, hint=hint)
+    middle = middle[: max(0, fits)]
+    space = rows - 1 - len(top) - len(middle) - len(bottom)
+    above = max(1, space // 2)
+    below = max(1, space - above)
+    return [*top, *[""] * above, *["  " + line for line in middle], *[""] * below, *bottom]
+
+
+def ask_yes(
+    question: str, *, default: bool = True, title: str = "", about: Sequence[str] = ()
+) -> bool:
+    """A yes/no question: a full-screen page with Yes and No side by side, Enter to choose.
+
+    ``about`` is what the question is about, shown above it (a text starting with "$ " is a
+    command line).
+    """
     if not can_menu():
         hint = "Y/n" if default else "y/N"
         answer = input(f"  {paint('?', 'cyan', 'bold')} {question} [{hint}] ")
         return default if not answer.strip() else answer.strip().lower().startswith("y")
+    options = [("Yes", "", ""), ("No", "", "")]
+    keys_hint = "\u2190\u2192 move \u00b7 Enter choose \u00b7 Y or N \u00b7 Ctrl-C stop"
 
     def render(current: int) -> list[str]:
-        mark = paint("?", "cyan", "bold")
-        choices = f"{button('Yes', current == 0)}  {button('No', current == 1)}"
-        hint = paint("\u2190\u2192 move \u00b7 Enter choose", "dim")
-        return [f"  {mark} {paint(question, 'bold')}   {choices}   {hint}"]
+        return page(question, options, current, title=title, about=about, hint=keys_hint)
 
-    yes = pick(2, render, default=0 if default else 1, keys={"y": 0, "o": 0, "n": 1},
-               horizontal=True) == 0  # fmt: skip
+    yes = pick(2, render, default=0 if default else 1, keys={"y": 0, "o": 0, "n": 1}) == 0
     answered(question, "Yes" if yes else "No")
     return yes
 
@@ -436,10 +573,13 @@ def choose(
     options: Sequence[tuple[str, str, str]],
     *,
     default: int = 0,
+    title: str = "",
+    about: Sequence[str] = (),
+    tip: str = "",
 ) -> int:
-    """A list of options, one window each: (name, short hint, description). Returns an index.
+    """Options as windows side by side on a full-screen page: (name, short hint, description).
 
-    The highlighted option is a bright window with a pointer, the others are dimmed.
+    Returns the chosen index. The highlighted window is bright, the others are dimmed.
     """
     if not can_menu():
         print()
@@ -454,23 +594,10 @@ def choose(
         return int(typed) - 1 if typed.isdigit() and 1 <= int(typed) <= len(options) else default
 
     def render(current: int) -> list[str]:
-        lines = [f"  {paint('?', 'cyan', 'bold')} {paint(question, 'bold')}", ""]
-        for index, (name, hint, text) in enumerate(options):
-            on = index == current
-            pointer = paint(g("arrow"), "cyan", "bold") if on else " "
-            title = f"{name}  {hint}".strip()
-            rows = [[(line, "" if on else "dim")] for line in wrap(text, box_width() - 6)]
-            box_lines = window(title, rows, color="cyan" if on else "dim")
-            if not on:  # a dimmed title too
-                box_lines[0] = paint(_visible(box_lines[0]), "dim")
-            marks = [pointer] + [" "] * (len(box_lines) - 1)
-            lines += [f"{mark} {line}" for mark, line in zip(marks, box_lines, strict=True)]
-        lines += ["", "  " + paint(KEY_HINT, "dim")]
-        return lines
+        return page(question, options, current, title=title, about=about, tip=tip)
 
-    print()
-    index = pick(len(options), render, default=default,
-                 keys={name[0].lower(): i for i, (name, _h, _t) in enumerate(options)})  # fmt: skip
+    shortcuts = {name[0].lower(): i for i, (name, _h, _t) in enumerate(options)}
+    index = pick(len(options), render, default=default, keys=shortcuts)
     answered(question, options[index][0])
     return index
 
@@ -502,7 +629,9 @@ def propose(command: Sequence[str], why: str, *, interactive: bool) -> bool:
     else:
         say(why)
         print(f"\n      $ {shown}\n")
-    if not interactive or ask_yes("Run it for you?"):
+    if not interactive or ask_yes(
+        "Run it for you?", title="The command", about=[why, f"$ {shown}"]
+    ):
         return True
     say("Run it in another window, then come back here.")
     input("    Press Enter when it is done. ")
@@ -979,7 +1108,9 @@ def download(target: Path, token: str, ref: str = "HEAD") -> str:
             extract(Path(archive.name), target)
     except urllib.error.HTTPError as exc:
         if exc.code in (404, 422) and ref != "HEAD":
-            raise SetupError(f"The branch {urllib.parse.unquote(ref)} does not exist in {REPO}.") from exc
+            raise SetupError(
+                f"The branch {urllib.parse.unquote(ref)} does not exist in {REPO}."
+            ) from exc
         raise SetupError(f"Could not download L'Usine ({exc}). Run this again.") from exc
     except urllib.error.URLError as exc:
         raise SetupError(f"Could not download L'Usine ({exc}). Run this again.") from exc
@@ -1113,7 +1244,10 @@ def visitor(target: Path, *, interactive: bool, dry_run: bool, branch: str | Non
         tip="Already signed in from a previous run? Then this step takes a second.",
     )
     if dry_run:
-        say(f"(dry run) sign in, then download the latest files of {REPO}" + (f" ({branch})" if branch else ""))
+        say(
+            f"(dry run) sign in, then download the latest files of {REPO}"
+            + (f" ({branch})" if branch else "")
+        )
         return
     token = get_token(interactive=interactive)
     step(
@@ -1183,7 +1317,13 @@ def install_tools(missing: list[str]) -> None:
     manager, ids = INSTALLERS.get(sys.platform, ("", {}))
     if not manager or not shutil.which(manager):
         return
-    if not ask_yes(f"Install {' and '.join(missing)} now with {manager}?"):
+    tools = " and ".join(missing)
+    about = [
+        f"Not found on this computer: {tools}.",
+        f"I can install {'them' if len(missing) > 1 else 'it'} now with {manager}, your "
+        "system's package manager. It takes a minute or two.",
+    ]
+    if not ask_yes(f"Install {tools} now with {manager}?", title="Missing tools", about=about):
         return
     for name in missing:
         if manager == "winget":
@@ -1213,7 +1353,13 @@ def developer(target: Path, *, interactive: bool, dry_run: bool, branch: str | N
     if missing:
         hint = {"darwin": "brew install git gh", "win32": "winget install Git.Git GitHub.cli"}
         how = hint.get(sys.platform, "your package manager")
-        if interactive and not dry_run and ask_yes("Continue as a visitor instead (no gh needed)?"):
+        about = [
+            f"Still missing: {', '.join(missing)}. Install with:",
+            f"$ {how}",
+            "Or carry on as a visitor: L'Usine downloads as plain files, nothing to install.",
+        ]
+        question = "Continue as a visitor instead (no gh needed)?"
+        if interactive and not dry_run and ask_yes(question, title="Missing tools", about=about):
             return visitor(target, interactive=interactive, dry_run=dry_run, branch=branch)
         raise SetupError(
             f"Missing: {', '.join(missing)}. Install with:  {how}\n"
@@ -1263,7 +1409,9 @@ def developer(target: Path, *, interactive: bool, dry_run: bool, branch: str | N
         if branch:
             fetch = ["git", "-C", str(target), "fetch", "origin", branch]
             switch = ["git", "-C", str(target), "checkout", branch]
-            if run_quiet(fetch, f"Fetching {branch}") or run_quiet(switch, f"Switching to {branch}"):
+            if run_quiet(fetch, f"Fetching {branch}") or run_quiet(
+                switch, f"Switching to {branch}"
+            ):
                 raise SetupError(f"Could not switch to the branch {branch}.")
         if propose(pull, why, interactive=interactive):
             run_quiet(pull, "Updating L'Usine")
@@ -1275,6 +1423,13 @@ def developer(target: Path, *, interactive: bool, dry_run: bool, branch: str | N
             raise SetupError("Could not clone L'Usine.")
         if not (target / ".git").is_dir():
             raise SetupError("The clone is not there yet. Run the command above, then this again.")
+
+
+WHO_WHY = (
+    "Welcome to the factory! Before I fetch anything, tell me how you plan to use L'Usine, "
+    "so that I only install what you need."
+)
+WHO_TIP = "Not sure? Pick Visitor: it is quicker. You can clone later in another folder."
 
 
 def choose_profile(asked: str | None, *, interactive: bool) -> str:
@@ -1300,7 +1455,11 @@ def choose_profile(asked: str | None, *, interactive: bool) -> str:
             "missing ones can be installed for you.",
         ),
     ]
-    picked = choose("How will you use L'Usine?", options, default=default)
+    title = f"Step 1 {g('sep')} Who are you?"
+    picked = choose(
+        "How will you use L'Usine?", options, default=default, title=title, about=[WHO_WHY],
+        tip=WHO_TIP,
+    )  # fmt: skip
     return "developer" if picked == 1 else "visitor"
 
 
@@ -1437,17 +1596,14 @@ def offer_shortcut(target: Path, *, interactive: bool, force: bool, skip: bool) 
     if skip or sys.platform not in ("darwin", "win32") or not (interactive or force):
         return
     if not force:
+        about = [
+            "Next time, you can start L'Usine with a double-click. I can put a shortcut on "
+            "your Desktop: it opens a terminal in the L'Usine folder and runs "
+            "`uv run lusine` for you.",
+            "To remove it later, just delete the file: nothing else is touched.",
+        ]
         print()
-        explain(
-            "One more thing",
-            [
-                "Next time, you can start L'Usine with a double-click. I can put a shortcut on "
-                "your Desktop: it opens a terminal in the L'Usine folder and runs "
-                "`uv run lusine` for you.",
-            ],
-            tip="To remove it later, just delete the file: nothing else is touched.",
-        )
-        if not ask_yes("Put a shortcut on your Desktop?"):
+        if not ask_yes("Put a shortcut on your Desktop?", title="One more thing", about=about):
             return
     try:
         file = create_shortcut(target)
@@ -1481,18 +1637,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ.setdefault("UV_NATIVE_TLS", "1")
         os.environ.setdefault("UV_SYSTEM_CERTS", "1")
     try:
-        banner()
-        step(
-            1,
-            "Who are you?",
-            [
-                "Welcome to the factory! Before I fetch anything, tell me how you plan to use "
-                "L'Usine, so that I only install what you need.",
-            ],
-            tip="Not sure? Pick Visitor: it is quicker. You can clone later in another folder.",
-        )
-        profile = choose_profile(args.profile, interactive=interactive)
         names = ["Who", "Tools", "Sign in", "Download", "Start"]
+        STEPS.update(total=len(names), names=names)  # "Tools" goes away for a visitor
+        step(1, "Who are you?", [WHO_WHY], tip=WHO_TIP)
+        profile = choose_profile(args.profile, interactive=interactive)
         if profile == "visitor":
             names.remove("Tools")
         STEPS.update(total=len(names), names=names)

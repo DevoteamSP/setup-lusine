@@ -529,7 +529,7 @@ def keys(fancy_terminal: None, monkeypatch: pytest.MonkeyPatch):
     pressed: list[str] = []
     monkeypatch.setattr(setup, "can_menu", lambda: True)
     monkeypatch.setattr(setup, "keyboard", contextlib.nullcontext)
-    monkeypatch.setattr(setup, "read_key", lambda: pressed.pop(0))
+    monkeypatch.setattr(setup, "read_key", lambda **_: pressed.pop(0))
     monkeypatch.setattr("builtins.input", lambda *_a: pytest.fail("a menu must not ask to type"))
     return pressed
 
@@ -566,3 +566,46 @@ def test_without_a_terminal_the_answer_is_typed(monkeypatch: pytest.MonkeyPatch)
     assert setup.choose_profile(None, interactive=True) == "developer"
     monkeypatch.setattr("builtins.input", lambda *_a: "n")
     assert setup.ask_yes("Run it?") is False
+
+
+PROFILES = [("Visitor", "(quickest)", "See it."), ("Developer", "", "Clone it all.")]
+
+
+def test_the_options_sit_side_by_side(
+    fancy_terminal: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(setup, "screen_size", lambda: (120, 30))
+    lines = [_visible(line) for line in setup.cards(PROFILES, 0, 116)]
+    assert "Visitor" in lines[0] and "Developer" in lines[0]  # both titles on the same row
+    assert "See it." in "".join(lines) and len({len(line) for line in lines}) == 1
+
+
+def test_a_narrow_terminal_stacks_the_options(fancy_terminal: None) -> None:
+    lines = [_visible(line) for line in setup.cards(PROFILES, 1, 40)]
+    assert not any("Visitor" in line and "Developer" in line for line in lines)
+    assert any("Visitor" in line for line in lines) and any("Developer" in line for line in lines)
+
+
+def test_the_page_fills_the_screen_without_scrolling(
+    fancy_terminal: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for size in ((80, 24), (200, 60), (40, 12)):
+        monkeypatch.setattr(setup, "screen_size", lambda size=size: size)
+        lines = setup.page("Pick one?", PROFILES, 0, title="Step 1", about=["Why."], tip="Tip.")
+        assert len(lines) <= size[1]
+        assert all(len(_visible(line)) <= size[0] for line in lines)
+    assert "Enter choose" in _visible(lines[-1])  # the keys, on the last line
+
+
+def test_the_train_shows_done_current_and_next_wagons(fancy_terminal: None) -> None:
+    setup.STEPS.update(total=3, names=["Who", "Sign in", "Start"])
+    lines = [_visible(line) for line in setup.train(2, 100)]
+    assert len(lines) == 4  # steam, roofs, wagons, wheels
+    wagons = lines[2]
+    assert wagons.index("✔ Who") < wagons.index("● Sign in") < wagons.index("○ Start")
+    assert "o" in lines[3]  # wheels
+
+
+def test_a_narrow_terminal_gets_the_one_line_road_map(fancy_terminal: None) -> None:
+    setup.STEPS.update(total=3, names=["Who", "Sign in", "Start"])
+    assert len(setup.train(2, 30)) == 1
