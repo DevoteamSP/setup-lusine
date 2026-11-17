@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import shlex
@@ -520,3 +521,48 @@ def test_without_a_keyboard_nothing_waits_and_no_browser_opens(
     monkeypatch.setattr("builtins.input", refuse)
     monkeypatch.setattr(setup.webbrowser, "open", refuse)
     assert setup.code_signin(interactive=False) == fake.token
+
+
+@pytest.fixture
+def keys(fancy_terminal: None, monkeypatch: pytest.MonkeyPatch):
+    """Scripted key presses for the arrow-key menus."""
+    pressed: list[str] = []
+    monkeypatch.setattr(setup, "can_menu", lambda: True)
+    monkeypatch.setattr(setup, "keyboard", contextlib.nullcontext)
+    monkeypatch.setattr(setup, "read_key", lambda: pressed.pop(0))
+    monkeypatch.setattr("builtins.input", lambda *_a: pytest.fail("a menu must not ask to type"))
+    return pressed
+
+
+def test_the_profile_is_chosen_with_the_arrows(keys: list[str], capsys) -> None:
+    keys += ["down", "enter"]
+    assert setup.choose_profile(None, interactive=True) == "developer"
+    out = _visible(capsys.readouterr().out)
+    assert "Visitor" in out and "Developer" in out and "Enter choose" in out
+
+
+def test_the_arrows_wrap_around_and_letters_jump(keys: list[str]) -> None:
+    keys += ["up", "enter"]  # up from the first option lands on the last one
+    assert setup.choose_profile(None, interactive=True) == "developer"
+    keys += ["d", "v", "enter"]
+    assert setup.choose_profile(None, interactive=True) == "visitor"
+
+
+def test_yes_or_no_without_typing(keys: list[str], capsys) -> None:
+    keys += ["enter"]
+    assert setup.ask_yes("Run it?") is True
+    keys += ["right", "enter"]
+    assert setup.ask_yes("Run it?") is False
+    keys += ["enter"]
+    assert setup.ask_yes("Run it?", default=False) is False
+    keys += ["y", "enter"]
+    assert setup.ask_yes("Run it?", default=False) is True
+    assert "Run it?  Yes" in _visible(capsys.readouterr().out)  # folded into the answer
+
+
+def test_without_a_terminal_the_answer_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(setup, "can_menu", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda *_a: "2")
+    assert setup.choose_profile(None, interactive=True) == "developer"
+    monkeypatch.setattr("builtins.input", lambda *_a: "n")
+    assert setup.ask_yes("Run it?") is False

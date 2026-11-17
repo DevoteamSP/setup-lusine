@@ -96,7 +96,10 @@ _PLAIN = {
     "arrow": ">", "sep": "-", "s_done": "[x]", "s_now": "[*]", "s_next": "[ ]",
     "eighths": " ", "pulse": "#####", "cut": "~",
 }  # fmt: skip
-STYLES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+STYLES = {
+    "bold": "1", "dim": "2", "reverse": "7",
+    "red": "31", "green": "32", "yellow": "33", "cyan": "36",
+}  # fmt: skip
 Parts = list[tuple[str, str]]  # a row of text: (text, "bold cyan") pieces
 
 
@@ -276,9 +279,213 @@ def step(number: int, title: str, why: Sequence[str] | str = "", tip: str = "") 
     )
 
 
+# --- menus -------------------------------------------------------------------------------------
+# Choices are made with the arrow keys and Enter, nothing to type. The menu is redrawn in place
+# and, once answered, folds into one line that keeps the answer. Without a real keyboard and
+# terminal (a pipe, CI, NO_COLOR) the questions fall back to typed answers.
+
+KEY_HINT = "\u2191\u2193 move \u00b7 Enter choose \u00b7 Ctrl-C stop"
+
+
+def can_menu() -> bool:
+    """True when arrow keys can be read and the screen redrawn."""
+    try:
+        return fancy() and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def read_key() -> str:
+    """One key press: 'up', 'down', 'left', 'right', 'enter', 'tab', 'esc' or the character.
+
+    Call it inside ``keyboard()`` on macOS and Linux, so keys arrive one by one, unechoed.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        key = msvcrt.getwch()
+        if key in ("\x00", "\xe0"):  # arrows come as two characters
+            return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch(), "")
+        if key == "\x03":
+            raise KeyboardInterrupt
+        return {"\r": "enter", "\n": "enter", "\t": "tab", "\x1b": "esc"}.get(key, key)
+    import select
+
+    fd = sys.stdin.fileno()
+    data = os.read(fd, 1)
+    if data == b"\x1b":  # an arrow is ESC [ A (or ESC O A); a lone ESC is the Esc key
+        while select.select([fd], [], [], 0.03)[0]:
+            data += os.read(fd, 1)
+            if data[-1:].isalpha() or data[-1:] == b"~":
+                break
+        arrows = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
+        return arrows.get(data[-1:], "") if len(data) > 1 else "esc"
+    if data == b"\x03":
+        raise KeyboardInterrupt
+    return {b"\r": "enter", b"\n": "enter", b"\t": "tab"}.get(data, data.decode(errors="ignore"))
+
+
+class keyboard:  # noqa: N801  (used as ``with keyboard():``)
+    """Keys one by one without echo, cursor hidden; everything restored on the way out."""
+
+    def __enter__(self) -> keyboard:
+        self.saved = None
+        if os.name != "nt":
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(fd)
+            tty.setcbreak(fd)  # Ctrl-C still stops
+        sys.stdout.write("\x1b[?25l")
+        sys.stdout.flush()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self.saved is not None:
+            import termios
+
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.saved)
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+
+
+class Screen:
+    """Lines drawn at the bottom of the terminal that can be redrawn or cleared in place."""
+
+    def __init__(self) -> None:
+        self.height = 0
+
+    def draw(self, lines: Sequence[str]) -> None:
+        self.clear()
+        sys.stdout.write("".join(line + "\n" for line in lines))
+        sys.stdout.flush()
+        self.height = len(lines)
+
+    def clear(self) -> None:
+        if self.height:
+            sys.stdout.write(f"\x1b[{self.height}F\x1b[J")  # up to the first line, erase below
+        self.height = 0
+
+
+def pick(
+    count: int,
+    render,
+    *,
+    default: int = 0,
+    keys: dict[str, int] | None = None,
+    horizontal: bool = False,
+) -> int:
+    """Let the person move a highlight over ``count`` options; returns the chosen index.
+
+    ``render(current)`` returns the lines to show. ``keys`` maps shortcut letters to options
+    (they move the highlight; Enter still confirms).
+    """
+    current, screen = default, Screen()
+    back = ("up", "left", "k", "h") if not horizontal else ("left", "up", "h", "k")
+    ahead = ("down", "right", "tab", "j", "l")
+    with keyboard():
+        try:
+            while True:
+                screen.draw(render(current))
+                key = read_key()
+                if key == "enter":
+                    return current
+                if key in back:
+                    current = (current - 1) % count
+                elif key in ahead:
+                    current = (current + 1) % count
+                elif key.isdigit() and 1 <= int(key) <= count:
+                    current = int(key) - 1
+                elif keys and key.lower() in keys:
+                    current = keys[key.lower()]
+        finally:
+            screen.clear()
+
+
+def answered(question: str, answer: str) -> None:
+    """What a menu folds into once answered."""
+    print(f"  {paint(g('ok'), 'green')} {question}  {paint(answer, 'bold', 'cyan')}")
+
+
+def button(label: str, on: bool) -> str:
+    return paint(f" {label} ", "reverse", "bold", "cyan") if on else paint(f" {label} ", "dim")
+
+
 def ask_yes(question: str, *, default: bool = True) -> bool:
-    answer = input(f"  {paint('?', 'cyan', 'bold')} {question} [{'Y/n' if default else 'y/N'}] ")
-    return default if not answer.strip() else answer.strip().lower().startswith("y")
+    """A yes/no question: two buttons, Left/Right (or Y/N) to move, Enter to choose."""
+    if not can_menu():
+        hint = "Y/n" if default else "y/N"
+        answer = input(f"  {paint('?', 'cyan', 'bold')} {question} [{hint}] ")
+        return default if not answer.strip() else answer.strip().lower().startswith("y")
+
+    def render(current: int) -> list[str]:
+        mark = paint("?", "cyan", "bold")
+        choices = f"{button('Yes', current == 0)}  {button('No', current == 1)}"
+        hint = paint("\u2190\u2192 move \u00b7 Enter choose", "dim")
+        return [f"  {mark} {paint(question, 'bold')}   {choices}   {hint}"]
+
+    yes = pick(2, render, default=0 if default else 1, keys={"y": 0, "o": 0, "n": 1},
+               horizontal=True) == 0  # fmt: skip
+    answered(question, "Yes" if yes else "No")
+    return yes
+
+
+def choose(
+    question: str,
+    options: Sequence[tuple[str, str, str]],
+    *,
+    default: int = 0,
+) -> int:
+    """A list of options, one window each: (name, short hint, description). Returns an index.
+
+    The highlighted option is a bright window with a pointer, the others are dimmed.
+    """
+    if not can_menu():
+        print()
+        for number, (name, hint, text) in enumerate(options, 1):
+            say(f"{number} {g('sep')} {name} {hint}".strip())
+            for line in wrap(text, 70):
+                say("  " + line)
+        print()
+        numbers = "/".join(str(n) for n in range(1, len(options) + 1))
+        prompt = f"  {paint('?', 'cyan', 'bold')} {question} {numbers} [{default + 1}]: "
+        typed = input(prompt).strip()
+        return int(typed) - 1 if typed.isdigit() and 1 <= int(typed) <= len(options) else default
+
+    def render(current: int) -> list[str]:
+        lines = [f"  {paint('?', 'cyan', 'bold')} {paint(question, 'bold')}", ""]
+        for index, (name, hint, text) in enumerate(options):
+            on = index == current
+            pointer = paint(g("arrow"), "cyan", "bold") if on else " "
+            title = f"{name}  {hint}".strip()
+            rows = [[(line, "" if on else "dim")] for line in wrap(text, box_width() - 6)]
+            box_lines = window(title, rows, color="cyan" if on else "dim")
+            if not on:  # a dimmed title too
+                box_lines[0] = paint(_visible(box_lines[0]), "dim")
+            marks = [pointer] + [" "] * (len(box_lines) - 1)
+            lines += [f"{mark} {line}" for mark, line in zip(marks, box_lines, strict=True)]
+        lines += ["", "  " + paint(KEY_HINT, "dim")]
+        return lines
+
+    print()
+    index = pick(len(options), render, default=default,
+                 keys={name[0].lower(): i for i, (name, _h, _t) in enumerate(options)})  # fmt: skip
+    answered(question, options[index][0])
+    return index
+
+
+def _visible(text: str) -> str:
+    """Text without its color codes."""
+    out, skip = [], False
+    for char in text:
+        if char == "\x1b":
+            skip = True
+        elif skip and char.isalpha():
+            skip = False
+        elif not skip:
+            out.append(char)
+    return "".join(out)
 
 
 def propose(command: Sequence[str], why: str, *, interactive: bool) -> bool:
@@ -1077,39 +1284,24 @@ def choose_profile(asked: str | None, *, interactive: bool) -> str:
         previous = MODE_FILE.read_text(encoding="utf-8").split()[0]
     except (OSError, IndexError):
         previous = "visitor"
-    default = "2" if previous == "developer" else "1"
+    default = 1 if previous == "developer" else 0
     if not interactive:
-        return "developer" if default == "2" else "visitor"
+        return "developer" if default else "visitor"
     options = [
         (
-            "1",
             "Visitor",
             "(quickest)",
-            ["I just want to see it. Nothing to install but uv; you sign in to GitHub once."],
+            "I just want to see it. Nothing to install but uv; you sign in to GitHub once.",
         ),
         (
-            "2",
             "Developer",
             "",
-            [
-                "I need to clone and have everything. Needs git and the GitHub "
-                "tool (gh); missing ones can be installed for you."
-            ],
+            "I need to clone and have everything. Needs git and the GitHub tool (gh); "
+            "missing ones can be installed for you.",
         ),
     ]
-    print()
-    for number, name, hint, lines in options:
-        title = f"{number} {g('sep')} {name} {hint}".strip()
-        if fancy():
-            show(window(title, paragraphs(lines), color="cyan" if number == default else "dim"))
-        else:
-            say(title)
-            for line in wrap(lines[0], 70):
-                say("  " + line)
-    print()
-    prompt = f"  {paint('?', 'cyan', 'bold')} Your choice, 1 or 2 [{default}]: "
-    choice = input(prompt).strip() or default
-    return "developer" if choice == "2" else "visitor"
+    picked = choose("How will you use L'Usine?", options, default=default)
+    return "developer" if picked == 1 else "visitor"
 
 
 def desktop_dir() -> Path:
